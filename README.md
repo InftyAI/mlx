@@ -27,7 +27,7 @@ make build
 make test
 ```
 
-Requirements: a recent Rust toolchain, `cmake`, and Xcode command-line tools.
+Requirements: a recent Rust toolchain, `make`, `cmake`, and Xcode command-line tools.
 The first build compiles MLX from source and takes several minutes.
 
 ## Examples
