@@ -1,3 +1,3 @@
-# template-repo
+# MLX
 
-A template repo.
+Rust bindings for Apple’s MLX framework.
