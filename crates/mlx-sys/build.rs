@@ -38,6 +38,21 @@ fn main() {
         cfg.define("MLX_BUILD_ACCELERATE", "ON");
     }
 
+    // Build into a fixed dir under `target/<profile>/` rather than the default
+    // per-fingerprint `OUT_DIR`. `cargo clippy` fingerprints `mlx-sys`
+    // differently from `cargo build`/`cargo test`, so an `OUT_DIR`-based build
+    // would recompile MLX from scratch for each (~2.5 min of C++). A shared dir
+    // lets them all reuse the same CMake build.
+    //
+    // OUT_DIR = <target>/<profile>/build/mlx-sys-<hash>/out; three parents up is
+    // <target>/<profile>.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let profile_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .expect("unexpected OUT_DIR layout");
+    cfg.out_dir(profile_dir.join("mlx-c-build"));
+
     let dst = cfg.build();
 
     // --- 2. Link directives ----------------------------------------------
@@ -70,7 +85,8 @@ fn main() {
         .generate()
         .expect("failed to generate mlx-c bindings");
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // bindings.rs stays in the real OUT_DIR — it's cheap to regenerate and
+    // `src/lib.rs` includes it from there.
     bindings
         .write_to_file(out_dir.join("bindings.rs"))
         .expect("failed to write bindings.rs");
