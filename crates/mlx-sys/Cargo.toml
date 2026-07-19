@@ -1,0 +1,23 @@
+[package]
+name = "mlx-sys"
+version = "0.0.0"
+# Edition 2021: bindgen 0.70 emits plain `extern "C"` blocks, which edition
+# 2024 rejects (it requires `unsafe extern`). The safe `mlx` crate stays 2024.
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Low-level FFI bindings to mlx-c, the C API for Apple's MLX framework."
+links = "mlxc"
+build = "build.rs"
+
+[features]
+default = ["metal", "accelerate"]
+# Build MLX with the Metal (GPU) backend. Apple Silicon only.
+metal = []
+# Build MLX against Apple's Accelerate framework for CPU BLAS.
+accelerate = []
+
+[build-dependencies]
+bindgen = "0.70"
+cmake = "0.1"
