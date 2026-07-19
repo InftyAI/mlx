@@ -19,19 +19,12 @@ MLX itself is C++, which Rust cannot bind to directly. We bind against
 [`mlx-c`](https://github.com/ml-explore/mlx-c), Apple's official C API, whose
 CMake build pulls in MLX via `FetchContent`.
 
-## Layout
-
-- `crates/mlx-sys` — `build.rs` compiles `mlx-c` (+ MLX) with CMake and runs
-  `bindgen` over `mlx/c/mlx.h`; `src/lib.rs` re-exports the generated bindings.
-- `crates/mlx` — safe wrappers (`Array`, ops, …) over `mlx-sys`.
-- `third_party/mlx-c` — pinned `mlx-c` submodule (currently `v0.6.0`).
-
 ## Building
 
 ```sh
 git submodule update --init --recursive
-cargo build
-cargo test
+make build
+make test
 ```
 
 Requirements: a recent Rust toolchain, `cmake`, and Xcode command-line tools.
