@@ -17,7 +17,7 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Workspace layout: <root>/crates/mlxr-sys -> <root>/third_party/mlx-c
+    // Workspace layout: <root>/crates/mlx-sys -> <root>/third_party/mlx-c
     let mlx_c_dir = manifest_dir
         .join("../../third_party/mlx-c")
         .canonicalize()
