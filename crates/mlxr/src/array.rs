@@ -287,8 +287,9 @@ macro_rules! impl_binop {
             impl std::ops::$trait for &Array {
                 type Output = Array;
                 fn $method(self, rhs: &Array) -> Array {
-                    self.$op(rhs, &Stream::default())
-                        .expect(concat!("Array::", stringify!($op), " failed"))
+                    self.$op(rhs, &Stream::default()).unwrap_or_else(|e| {
+                        panic!(concat!("Array::", stringify!($op), " failed: {}"), e)
+                    })
                 }
             }
         )*
@@ -306,7 +307,7 @@ impl std::ops::Neg for &Array {
     type Output = Array;
     fn neg(self) -> Array {
         self.negative(&Stream::default())
-            .expect("Array::negative failed")
+            .unwrap_or_else(|e| panic!("Array::negative failed: {e}"))
     }
 }
 
@@ -469,5 +470,15 @@ mod tests {
 
         // Operands are borrowed, so `a` is still usable here.
         assert_eq!(a.to_vec::<f32>(), vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Array::add failed: MLX error:")]
+    fn operator_panic_carries_mlx_message() {
+        // A failing operator panics with both the op name and the underlying
+        // MLX diagnostic, not a generic message.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let _ = &a + &b;
     }
 }
