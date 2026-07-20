@@ -95,10 +95,18 @@ impl Array {
     /// The element type `T` selects the accessor at compile time, e.g.
     /// `a.item::<f32>()`. Evaluates the array first. MLX casts the stored dtype
     /// to `T`.
+    ///
+    /// # Panics
+    /// Panics if the array is not a single-element array (`size() != 1`).
     pub fn item<T: ArrayElement>(&self) -> T {
         self.eval();
-        // SAFETY: the array is evaluated above; `read_item` picks the accessor
-        // matching `T`.
+        let size = self.size();
+        assert_eq!(
+            size, 1,
+            "item() requires a single-element array, but this array has {size} elements"
+        );
+        // SAFETY: `read_item` requires an evaluated, single-element array — both
+        // ensured above — and picks the accessor matching `T`.
         unsafe { T::read_item(self.handle) }
     }
 
@@ -430,6 +438,13 @@ mod tests {
         assert_eq!(a.item::<f32>(), 42.0);
         let b = Array::from_slice(&[7i32], &[]);
         assert_eq!(b.item::<i32>(), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a single-element array")]
+    fn item_on_non_scalar_panics() {
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let _ = a.item::<f32>();
     }
 
     #[test]
