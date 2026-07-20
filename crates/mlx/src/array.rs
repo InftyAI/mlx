@@ -6,6 +6,7 @@ use std::fmt;
 use mlx_sys as sys;
 
 use crate::dtype::ArrayElement;
+use crate::stream::Stream;
 
 /// An N-dimensional MLX array.
 ///
@@ -24,8 +25,6 @@ impl Array {
     }
 
     /// Returns the raw handle. The `Array` retains ownership.
-    // Scaffolding for ops that need the underlying handle; unused for now.
-    #[allow(dead_code)]
     pub(crate) fn as_raw(&self) -> sys::mlx_array {
         self.handle
     }
@@ -76,6 +75,155 @@ impl Array {
         let ptr = unsafe { sys::mlx_array_shape(self.handle) };
         (0..ndim).map(|i| unsafe { *ptr.add(i) }).collect()
     }
+
+    /// Forces evaluation of this array.
+    ///
+    /// MLX is lazy: ops build a graph and only compute when the result is
+    /// needed. `eval` materializes the values now.
+    pub fn eval(&self) {
+        // SAFETY: handle is valid for the lifetime of `self`.
+        unsafe {
+            sys::mlx_array_eval(self.handle);
+        }
+    }
+
+    /// Reads the value of a scalar (single-element) array.
+    ///
+    /// The element type `T` selects the accessor at compile time, e.g.
+    /// `a.item::<f32>()`. Evaluates the array first. MLX casts the stored dtype
+    /// to `T`.
+    pub fn item<T: ArrayElement>(&self) -> T {
+        self.eval();
+        // SAFETY: the array is evaluated above; `read_item` picks the accessor
+        // matching `T`.
+        unsafe { T::read_item(self.handle) }
+    }
+
+    /// Copies the array's contents into a `Vec<T>`, row-major.
+    ///
+    /// The element type `T` selects the accessor at compile time, e.g.
+    /// `a.to_vec::<f32>()`. Evaluates the array first.
+    ///
+    /// # Panics
+    /// Panics if `T::DTYPE` does not match the array's dtype.
+    pub fn to_vec<T: ArrayElement>(&self) -> Vec<T> {
+        self.eval();
+        // SAFETY: mlx_array_dtype reads a valid handle.
+        let dtype = unsafe { sys::mlx_array_dtype(self.handle) };
+        assert_eq!(
+            dtype,
+            T::DTYPE,
+            "array dtype does not match requested element type"
+        );
+        let len = self.size();
+        // SAFETY: dtype matches `T` (checked above), so the pointer is valid for
+        // `size` contiguous `T` until the array is mutated or freed.
+        let ptr = unsafe { T::data_ptr(self.handle) };
+        (0..len).map(|i| unsafe { *ptr.add(i) }).collect()
+    }
+
+    /// Elementwise addition: `self + other`.
+    pub fn add(&self, other: &Array, stream: &Stream) -> Array {
+        self.binary_op(other, stream, sys::mlx_add)
+    }
+
+    /// Elementwise subtraction: `self - other`.
+    pub fn subtract(&self, other: &Array, stream: &Stream) -> Array {
+        self.binary_op(other, stream, sys::mlx_subtract)
+    }
+
+    /// Elementwise multiplication: `self * other`.
+    pub fn multiply(&self, other: &Array, stream: &Stream) -> Array {
+        self.binary_op(other, stream, sys::mlx_multiply)
+    }
+
+    /// Elementwise division: `self / other`.
+    pub fn divide(&self, other: &Array, stream: &Stream) -> Array {
+        self.binary_op(other, stream, sys::mlx_divide)
+    }
+
+    /// Elementwise square root.
+    pub fn sqrt(&self, stream: &Stream) -> Array {
+        self.unary_op(stream, sys::mlx_sqrt)
+    }
+
+    /// Elementwise exponential.
+    pub fn exp(&self, stream: &Stream) -> Array {
+        self.unary_op(stream, sys::mlx_exp)
+    }
+
+    /// Elementwise absolute value.
+    pub fn abs(&self, stream: &Stream) -> Array {
+        self.unary_op(stream, sys::mlx_abs)
+    }
+
+    /// Elementwise negation.
+    pub fn negative(&self, stream: &Stream) -> Array {
+        self.unary_op(stream, sys::mlx_negative)
+    }
+
+    /// Sum of all elements, returning a scalar array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional.
+    pub fn sum(&self, keepdims: bool, stream: &Stream) -> Array {
+        self.reduce_op(keepdims, stream, sys::mlx_sum)
+    }
+
+    /// Mean of all elements, returning a scalar array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional.
+    pub fn mean(&self, keepdims: bool, stream: &Stream) -> Array {
+        self.reduce_op(keepdims, stream, sys::mlx_mean)
+    }
+
+    /// Shared plumbing for `res = op(a, b, stream)` binary ops.
+    fn binary_op(
+        &self,
+        other: &Array,
+        stream: &Stream,
+        op: unsafe extern "C" fn(
+            *mut sys::mlx_array,
+            sys::mlx_array,
+            sys::mlx_array,
+            sys::mlx_stream,
+        ) -> i32,
+    ) -> Array {
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: all handles are valid; `op` writes the result into `out`.
+        unsafe {
+            op(&mut out, self.handle, other.as_raw(), stream.as_raw());
+            Self::from_raw(out)
+        }
+    }
+
+    /// Shared plumbing for `res = op(a, stream)` unary ops.
+    fn unary_op(
+        &self,
+        stream: &Stream,
+        op: unsafe extern "C" fn(*mut sys::mlx_array, sys::mlx_array, sys::mlx_stream) -> i32,
+    ) -> Array {
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; `op` writes the result into `out`.
+        unsafe {
+            op(&mut out, self.handle, stream.as_raw());
+            Self::from_raw(out)
+        }
+    }
+
+    /// Shared plumbing for `res = op(a, keepdims, stream)` full reductions.
+    fn reduce_op(
+        &self,
+        keepdims: bool,
+        stream: &Stream,
+        op: unsafe extern "C" fn(*mut sys::mlx_array, sys::mlx_array, bool, sys::mlx_stream) -> i32,
+    ) -> Array {
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; `op` writes the result into `out`.
+        unsafe {
+            op(&mut out, self.handle, keepdims, stream.as_raw());
+            Self::from_raw(out)
+        }
+    }
 }
 
 impl fmt::Debug for Array {
@@ -96,6 +244,39 @@ impl Drop for Array {
         unsafe {
             sys::mlx_array_free(self.handle);
         }
+    }
+}
+
+// Arithmetic operators run on the current default stream (see
+// [`Stream::set_as_default`]). For explicit stream control, call the inherent
+// methods (`a.add(&b, &stream)`) instead.
+//
+// Implemented on `&Array` so operands are borrowed, not consumed: `&a + &b`
+// leaves both arrays usable afterwards.
+macro_rules! impl_binop {
+    ($($trait:ident :: $method:ident => $op:ident),* $(,)?) => {
+        $(
+            impl std::ops::$trait for &Array {
+                type Output = Array;
+                fn $method(self, rhs: &Array) -> Array {
+                    self.$op(rhs, &Stream::default())
+                }
+            }
+        )*
+    };
+}
+
+impl_binop! {
+    Add::add => add,
+    Sub::sub => subtract,
+    Mul::mul => multiply,
+    Div::div => divide,
+}
+
+impl std::ops::Neg for &Array {
+    type Output = Array;
+    fn neg(self) -> Array {
+        self.negative(&Stream::default())
     }
 }
 
@@ -140,5 +321,89 @@ mod tests {
         let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
         let s = format!("{a:?}");
         assert!(s.contains("array"), "unexpected debug output: {s}");
+    }
+
+    #[test]
+    fn binary_ops_compute_elementwise() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = Array::from_slice(&[4.0f32, 5.0, 6.0], &[3]);
+
+        assert_eq!(a.add(&b, &s).to_vec::<f32>(), vec![5.0, 7.0, 9.0]);
+        assert_eq!(b.subtract(&a, &s).to_vec::<f32>(), vec![3.0, 3.0, 3.0]);
+        assert_eq!(a.multiply(&b, &s).to_vec::<f32>(), vec![4.0, 10.0, 18.0]);
+        assert_eq!(b.divide(&a, &s).to_vec::<f32>(), vec![4.0, 2.5, 2.0]);
+    }
+
+    #[test]
+    fn unary_ops_compute_elementwise() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 4.0, 9.0], &[3]);
+        assert_eq!(a.sqrt(&s).to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+
+        let b = Array::from_slice(&[-1.0f32, 2.0, -3.0], &[3]);
+        assert_eq!(b.abs(&s).to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(b.negative(&s).to_vec::<f32>(), vec![1.0, -2.0, 3.0]);
+    }
+
+    #[test]
+    fn reductions_produce_scalars() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+
+        let sum = a.sum(false, &s);
+        assert_eq!(sum.ndim(), 0);
+        assert_eq!(sum.item::<f32>(), 10.0);
+
+        assert_eq!(a.mean(false, &s).item::<f32>(), 2.5);
+    }
+
+    #[test]
+    fn keepdims_retains_rank() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let sum = a.sum(true, &s);
+        assert_eq!(sum.shape(), vec![1, 1]);
+        assert_eq!(sum.item::<f32>(), 10.0);
+    }
+
+    #[test]
+    fn item_reads_scalar() {
+        let a = Array::from_slice(&[42.0f32], &[]);
+        assert_eq!(a.item::<f32>(), 42.0);
+        let b = Array::from_slice(&[7i32], &[]);
+        assert_eq!(b.item::<i32>(), 7);
+    }
+
+    #[test]
+    fn to_vec_is_generic_over_dtype() {
+        let ints = Array::from_slice(&[1i32, 2, 3], &[3]);
+        assert_eq!(ints.to_vec::<i32>(), vec![1, 2, 3]);
+        let floats = Array::from_slice(&[1.5f32, 2.5], &[2]);
+        assert_eq!(floats.to_vec::<f32>(), vec![1.5, 2.5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not match requested element type")]
+    fn to_vec_wrong_dtype_panics() {
+        let ints = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let _ = ints.to_vec::<f32>();
+    }
+
+    #[test]
+    fn operators_match_methods() {
+        // Operators run on the default stream; results should equal the
+        // explicit-method equivalents.
+        let a = Array::from_slice(&[10.0f32, 20.0, 30.0], &[3]);
+        let b = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+
+        assert_eq!((&a + &b).to_vec::<f32>(), vec![11.0, 22.0, 33.0]);
+        assert_eq!((&a - &b).to_vec::<f32>(), vec![9.0, 18.0, 27.0]);
+        assert_eq!((&a * &b).to_vec::<f32>(), vec![10.0, 40.0, 90.0]);
+        assert_eq!((&a / &b).to_vec::<f32>(), vec![10.0, 10.0, 10.0]);
+        assert_eq!((-&a).to_vec::<f32>(), vec![-10.0, -20.0, -30.0]);
+
+        // Operands are borrowed, so `a` is still usable here.
+        assert_eq!(a.to_vec::<f32>(), vec![10.0, 20.0, 30.0]);
     }
 }
