@@ -1,8 +1,8 @@
 [package]
-name = "mlx-sys"
+name = "mlxcore-sys"
 version = "0.0.0"
 # Edition 2021: bindgen 0.70 emits plain `extern "C"` blocks, which edition
-# 2024 rejects (it requires `unsafe extern`). The safe `mlx` crate stays 2024.
+# 2024 rejects (it requires `unsafe extern`). The safe `mlxcore` crate stays 2024.
 edition = "2021"
 license.workspace = true
 repository.workspace = true

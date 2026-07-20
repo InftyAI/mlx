@@ -1,4 +1,4 @@
-//! Build script for `mlx-sys`.
+//! Build script for `mlxcore-sys`.
 //!
 //! 1. Builds the vendored `mlx-c` C API with CMake. `mlx-c` uses CMake
 //!    `FetchContent` to download and build MLX itself, so both `libmlxc` and
@@ -13,11 +13,11 @@ use std::path::PathBuf;
 
 fn main() {
     if !cfg!(target_os = "macos") {
-        panic!("mlx-sys currently only supports macOS on Apple Silicon");
+        panic!("mlxcore-sys currently only supports macOS on Apple Silicon");
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Workspace layout: <root>/crates/mlx-sys -> <root>/third_party/mlx-c
+    // Workspace layout: <root>/crates/mlxcore-sys -> <root>/third_party/mlx-c
     let mlx_c_dir = manifest_dir
         .join("../../third_party/mlx-c")
         .canonicalize()
@@ -39,12 +39,12 @@ fn main() {
     }
 
     // Build into a fixed dir under `target/<profile>/` rather than the default
-    // per-fingerprint `OUT_DIR`. `cargo clippy` fingerprints `mlx-sys`
+    // per-fingerprint `OUT_DIR`. `cargo clippy` fingerprints `mlxcore-sys`
     // differently from `cargo build`/`cargo test`, so an `OUT_DIR`-based build
     // would recompile MLX from scratch for each (~2.5 min of C++). A shared dir
     // lets them all reuse the same CMake build.
     //
-    // OUT_DIR = <target>/<profile>/build/mlx-sys-<hash>/out; three parents up is
+    // OUT_DIR = <target>/<profile>/build/mlxcore-sys-<hash>/out; three parents up is
     // <target>/<profile>.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let profile_dir = out_dir
