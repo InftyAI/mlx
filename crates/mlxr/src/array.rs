@@ -3,7 +3,7 @@
 use std::ffi::CStr;
 use std::fmt;
 
-use mlx_sys as sys;
+use mlxr_sys as sys;
 
 use crate::dtype::ArrayElement;
 use crate::error::{self, Result};

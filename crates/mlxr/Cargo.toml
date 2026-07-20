@@ -1,5 +1,5 @@
 [package]
-name = "mlx"
+name = "mlxr"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,8 @@ description = "Safe, idiomatic Rust bindings for Apple's MLX array framework."
 
 [features]
 default = ["metal", "accelerate"]
-metal = ["mlx-sys/metal"]
-accelerate = ["mlx-sys/accelerate"]
+metal = ["mlxr-sys/metal"]
+accelerate = ["mlxr-sys/accelerate"]
 
 [dependencies]
-mlx-sys.workspace = true
+mlxr-sys.workspace = true

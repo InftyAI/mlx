@@ -4,7 +4,7 @@
 //! (CPU or GPU). Most ops take a stream argument. MLX's own default is the GPU
 //! when a GPU backend is available (as on Apple Silicon), else the CPU.
 
-use mlx_sys as sys;
+use mlxr_sys as sys;
 
 /// An execution stream bound to a device.
 pub struct Stream {

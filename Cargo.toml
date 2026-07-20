@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/mlx-sys", "crates/mlx"]
+members = ["crates/mlxr-sys", "crates/mlxr"]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/InftyAI/mlx"
+repository = "https://github.com/InftyAI/mlxr"
 authors = ["kerthcet"]
 
 [workspace.dependencies]
-mlx-sys = { path = "crates/mlx-sys", version = "0.0.0" }
+mlxr-sys = { path = "crates/mlxr-sys", version = "0.0.0" }
