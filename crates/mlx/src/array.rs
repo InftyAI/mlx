@@ -6,6 +6,7 @@ use std::fmt;
 use mlx_sys as sys;
 
 use crate::dtype::ArrayElement;
+use crate::error::{self, Result};
 use crate::stream::Stream;
 
 /// An N-dimensional MLX array.
@@ -123,56 +124,56 @@ impl Array {
     }
 
     /// Elementwise addition: `self + other`.
-    pub fn add(&self, other: &Array, stream: &Stream) -> Array {
+    pub fn add(&self, other: &Array, stream: &Stream) -> Result<Array> {
         self.binary_op(other, stream, sys::mlx_add)
     }
 
     /// Elementwise subtraction: `self - other`.
-    pub fn subtract(&self, other: &Array, stream: &Stream) -> Array {
+    pub fn subtract(&self, other: &Array, stream: &Stream) -> Result<Array> {
         self.binary_op(other, stream, sys::mlx_subtract)
     }
 
     /// Elementwise multiplication: `self * other`.
-    pub fn multiply(&self, other: &Array, stream: &Stream) -> Array {
+    pub fn multiply(&self, other: &Array, stream: &Stream) -> Result<Array> {
         self.binary_op(other, stream, sys::mlx_multiply)
     }
 
     /// Elementwise division: `self / other`.
-    pub fn divide(&self, other: &Array, stream: &Stream) -> Array {
+    pub fn divide(&self, other: &Array, stream: &Stream) -> Result<Array> {
         self.binary_op(other, stream, sys::mlx_divide)
     }
 
     /// Elementwise square root.
-    pub fn sqrt(&self, stream: &Stream) -> Array {
+    pub fn sqrt(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_sqrt)
     }
 
     /// Elementwise exponential.
-    pub fn exp(&self, stream: &Stream) -> Array {
+    pub fn exp(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_exp)
     }
 
     /// Elementwise absolute value.
-    pub fn abs(&self, stream: &Stream) -> Array {
+    pub fn abs(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_abs)
     }
 
     /// Elementwise negation.
-    pub fn negative(&self, stream: &Stream) -> Array {
+    pub fn negative(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_negative)
     }
 
     /// Sum of all elements, returning a scalar array.
     ///
     /// With `keepdims == false` the result is 0-dimensional.
-    pub fn sum(&self, keepdims: bool, stream: &Stream) -> Array {
+    pub fn sum(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_op(keepdims, stream, sys::mlx_sum)
     }
 
     /// Mean of all elements, returning a scalar array.
     ///
     /// With `keepdims == false` the result is 0-dimensional.
-    pub fn mean(&self, keepdims: bool, stream: &Stream) -> Array {
+    pub fn mean(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_op(keepdims, stream, sys::mlx_mean)
     }
 
@@ -187,13 +188,12 @@ impl Array {
             sys::mlx_array,
             sys::mlx_stream,
         ) -> i32,
-    ) -> Array {
+    ) -> Result<Array> {
+        error::install();
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: all handles are valid; `op` writes the result into `out`.
-        unsafe {
-            op(&mut out, self.handle, other.as_raw(), stream.as_raw());
-            Self::from_raw(out)
-        }
+        let status = unsafe { op(&mut out, self.handle, other.as_raw(), stream.as_raw()) };
+        Self::from_op(out, status)
     }
 
     /// Shared plumbing for `res = op(a, stream)` unary ops.
@@ -201,13 +201,12 @@ impl Array {
         &self,
         stream: &Stream,
         op: unsafe extern "C" fn(*mut sys::mlx_array, sys::mlx_array, sys::mlx_stream) -> i32,
-    ) -> Array {
+    ) -> Result<Array> {
+        error::install();
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: handle/stream are valid; `op` writes the result into `out`.
-        unsafe {
-            op(&mut out, self.handle, stream.as_raw());
-            Self::from_raw(out)
-        }
+        let status = unsafe { op(&mut out, self.handle, stream.as_raw()) };
+        Self::from_op(out, status)
     }
 
     /// Shared plumbing for `res = op(a, keepdims, stream)` full reductions.
@@ -216,12 +215,27 @@ impl Array {
         keepdims: bool,
         stream: &Stream,
         op: unsafe extern "C" fn(*mut sys::mlx_array, sys::mlx_array, bool, sys::mlx_stream) -> i32,
-    ) -> Array {
+    ) -> Result<Array> {
+        error::install();
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: handle/stream are valid; `op` writes the result into `out`.
-        unsafe {
-            op(&mut out, self.handle, keepdims, stream.as_raw());
-            Self::from_raw(out)
+        let status = unsafe { op(&mut out, self.handle, keepdims, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
+    /// Wraps an op's `out` handle and status code into a `Result`.
+    ///
+    /// On failure, frees the (unused) `out` handle and returns the captured
+    /// MLX error message.
+    fn from_op(out: sys::mlx_array, status: i32) -> Result<Array> {
+        match error::check(status) {
+            Ok(()) => Ok(unsafe { Self::from_raw(out) }),
+            Err(e) => {
+                // SAFETY: `out` was created by mlx and is owned here; free it so
+                // the failed op doesn't leak.
+                unsafe { sys::mlx_array_free(out) };
+                Err(e)
+            }
         }
     }
 }
@@ -248,8 +262,11 @@ impl Drop for Array {
 }
 
 // Arithmetic operators run on the current default stream (see
-// [`Stream::set_as_default`]). For explicit stream control, call the inherent
-// methods (`a.add(&b, &stream)`) instead.
+// [`Stream::set_as_default`]). For explicit stream control — and to handle
+// errors — call the inherent methods (`a.add(&b, &stream)?`) instead.
+//
+// Operators cannot return `Result`, so they **panic** if the underlying op
+// fails (e.g. incompatible shapes). Use the methods when failure is possible.
 //
 // Implemented on `&Array` so operands are borrowed, not consumed: `&a + &b`
 // leaves both arrays usable afterwards.
@@ -260,6 +277,7 @@ macro_rules! impl_binop {
                 type Output = Array;
                 fn $method(self, rhs: &Array) -> Array {
                     self.$op(rhs, &Stream::default())
+                        .expect(concat!("Array::", stringify!($op), " failed"))
                 }
             }
         )*
@@ -277,6 +295,7 @@ impl std::ops::Neg for &Array {
     type Output = Array;
     fn neg(self) -> Array {
         self.negative(&Stream::default())
+            .expect("Array::negative failed")
     }
 }
 
@@ -329,21 +348,33 @@ mod tests {
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
         let b = Array::from_slice(&[4.0f32, 5.0, 6.0], &[3]);
 
-        assert_eq!(a.add(&b, &s).to_vec::<f32>(), vec![5.0, 7.0, 9.0]);
-        assert_eq!(b.subtract(&a, &s).to_vec::<f32>(), vec![3.0, 3.0, 3.0]);
-        assert_eq!(a.multiply(&b, &s).to_vec::<f32>(), vec![4.0, 10.0, 18.0]);
-        assert_eq!(b.divide(&a, &s).to_vec::<f32>(), vec![4.0, 2.5, 2.0]);
+        assert_eq!(a.add(&b, &s).unwrap().to_vec::<f32>(), vec![5.0, 7.0, 9.0]);
+        assert_eq!(
+            b.subtract(&a, &s).unwrap().to_vec::<f32>(),
+            vec![3.0, 3.0, 3.0]
+        );
+        assert_eq!(
+            a.multiply(&b, &s).unwrap().to_vec::<f32>(),
+            vec![4.0, 10.0, 18.0]
+        );
+        assert_eq!(
+            b.divide(&a, &s).unwrap().to_vec::<f32>(),
+            vec![4.0, 2.5, 2.0]
+        );
     }
 
     #[test]
     fn unary_ops_compute_elementwise() {
         let s = Stream::cpu();
         let a = Array::from_slice(&[1.0f32, 4.0, 9.0], &[3]);
-        assert_eq!(a.sqrt(&s).to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(a.sqrt(&s).unwrap().to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
 
         let b = Array::from_slice(&[-1.0f32, 2.0, -3.0], &[3]);
-        assert_eq!(b.abs(&s).to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
-        assert_eq!(b.negative(&s).to_vec::<f32>(), vec![1.0, -2.0, 3.0]);
+        assert_eq!(b.abs(&s).unwrap().to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(
+            b.negative(&s).unwrap().to_vec::<f32>(),
+            vec![1.0, -2.0, 3.0]
+        );
     }
 
     #[test]
@@ -351,20 +382,34 @@ mod tests {
         let s = Stream::cpu();
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
 
-        let sum = a.sum(false, &s);
+        let sum = a.sum(false, &s).unwrap();
         assert_eq!(sum.ndim(), 0);
         assert_eq!(sum.item::<f32>(), 10.0);
 
-        assert_eq!(a.mean(false, &s).item::<f32>(), 2.5);
+        assert_eq!(a.mean(false, &s).unwrap().item::<f32>(), 2.5);
     }
 
     #[test]
     fn keepdims_retains_rank() {
         let s = Stream::cpu();
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
-        let sum = a.sum(true, &s);
+        let sum = a.sum(true, &s).unwrap();
         assert_eq!(sum.shape(), vec![1, 1]);
         assert_eq!(sum.item::<f32>(), 10.0);
+    }
+
+    #[test]
+    fn incompatible_shapes_return_err() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        // Broadcasting [3] against [2] is invalid; MLX should report an error
+        // rather than aborting the process.
+        let err = a.add(&b, &s).unwrap_err();
+        assert!(
+            !err.message().is_empty(),
+            "expected a non-empty error message"
+        );
     }
 
     #[test]

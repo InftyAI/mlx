@@ -5,10 +5,12 @@
 
 mod array;
 mod dtype;
+mod error;
 mod stream;
 
 pub use array::Array;
 pub use dtype::ArrayElement;
+pub use error::{Error, Result};
 pub use stream::Stream;
 
 /// Returns the version string of the underlying MLX library.
