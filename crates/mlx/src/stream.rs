@@ -14,6 +14,7 @@ pub struct Stream {
 impl Stream {
     /// The default stream on the GPU device.
     pub fn gpu() -> Self {
+        crate::error::install();
         // SAFETY: constructor returns an owned handle.
         let handle = unsafe { sys::mlx_default_gpu_stream_new() };
         Self { handle }
@@ -21,6 +22,7 @@ impl Stream {
 
     /// The default stream on the CPU device.
     pub fn cpu() -> Self {
+        crate::error::install();
         // SAFETY: constructor returns an owned handle.
         let handle = unsafe { sys::mlx_default_cpu_stream_new() };
         Self { handle }
@@ -39,6 +41,7 @@ impl Stream {
     /// current default. Call this once at startup to steer them onto a chosen
     /// device.
     pub fn set_as_default(&self) {
+        crate::error::install();
         // SAFETY: `handle` is a valid stream owned by `self`; mlx copies out of
         // the pointers we pass and out of the handle.
         unsafe {
@@ -58,6 +61,7 @@ impl Default for Stream {
     /// a GPU backend (Metal) is available, otherwise the CPU. This only reads
     /// that default; use [`Stream::set_as_default`] to change it.
     fn default() -> Self {
+        crate::error::install();
         // SAFETY: out-params are valid; mlx writes owned handles into them.
         let handle = unsafe {
             let mut dev = sys::mlx_device_new();

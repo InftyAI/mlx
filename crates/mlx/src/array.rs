@@ -45,6 +45,7 @@ impl Array {
             "data length {} does not match shape product {expected}",
             data.len()
         );
+        error::install();
         // SAFETY: pointers/len are valid for the duration of the call; mlx
         // copies the data into its own buffer.
         let handle = unsafe {
@@ -82,6 +83,7 @@ impl Array {
     /// MLX is lazy: ops build a graph and only compute when the result is
     /// needed. `eval` materializes the values now.
     pub fn eval(&self) {
+        error::install();
         // SAFETY: handle is valid for the lifetime of `self`.
         unsafe {
             sys::mlx_array_eval(self.handle);
@@ -117,10 +119,18 @@ impl Array {
             "array dtype does not match requested element type"
         );
         let len = self.size();
-        // SAFETY: dtype matches `T` (checked above), so the pointer is valid for
-        // `size` contiguous `T` until the array is mutated or freed.
+        // `from_raw_parts` requires a non-null, aligned pointer even for a
+        // zero-length slice, but mlx may return null for an empty array.
+        if len == 0 {
+            return Vec::new();
+        }
+        // SAFETY: dtype matches `T` (checked above), so mlx guarantees `len`
+        // contiguous, aligned `T` at `ptr`, valid until the array is mutated or
+        // freed. We only read (and copy out of) the slice within this call, so
+        // the borrow cannot outlive the buffer. `T: Copy`, so `to_vec` is a
+        // single bulk copy rather than `len` individual derefs.
         let ptr = unsafe { T::data_ptr(self.handle) };
-        (0..len).map(|i| unsafe { *ptr.add(i) }).collect()
+        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
     }
 
     /// Elementwise addition: `self + other`.
@@ -242,6 +252,7 @@ impl Array {
 
 impl fmt::Debug for Array {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        error::install();
         // SAFETY: a freshly-created string handle is written by tostring.
         let mut s = unsafe { sys::mlx_string_new() };
         unsafe { sys::mlx_array_tostring(&mut s, self.handle) };
@@ -433,6 +444,14 @@ mod tests {
     fn to_vec_wrong_dtype_panics() {
         let ints = Array::from_slice(&[1i32, 2, 3], &[3]);
         let _ = ints.to_vec::<f32>();
+    }
+
+    #[test]
+    fn to_vec_of_empty_array_is_empty() {
+        // A zero-element array must not deref a (possibly null) data pointer.
+        let empty = Array::from_slice::<f32>(&[], &[0]);
+        assert_eq!(empty.size(), 0);
+        assert!(empty.to_vec::<f32>().is_empty());
     }
 
     #[test]

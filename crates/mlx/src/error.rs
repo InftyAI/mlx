@@ -86,7 +86,14 @@ pub(crate) fn take() -> Option<String> {
 ///
 /// A non-zero `status` means the op failed; the message (if any) comes from the
 /// handler that fired during the call.
+///
+/// Defensively ensures our handler is installed. This cannot rescue the op
+/// whose `status` we are checking — that call has already returned — but it
+/// guarantees any op reaching this central conversion point leaves the
+/// process-wide handler in the non-fatal state, so MLX's default `exit(-1)`
+/// handler can never linger even if a call site forgets to call [`install`].
 pub(crate) fn check(status: i32) -> Result<()> {
+    install();
     if status == 0 {
         Ok(())
     } else {
