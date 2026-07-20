@@ -95,6 +95,9 @@ pub(crate) fn take() -> Option<String> {
 pub(crate) fn check(status: i32) -> Result<()> {
     install();
     if status == 0 {
+        // Clear any message left by an earlier call so it can never be
+        // misattributed to a later failure whose handler did not fire.
+        take();
         Ok(())
     } else {
         Err(Error::new(
