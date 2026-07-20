@@ -5,10 +5,10 @@
 //! cargo run --example hello
 //! ```
 
-use mlxr::{Array, Stream};
+use mlxcore::{Array, Stream};
 
-fn main() -> mlxr::Result<()> {
-    println!("MLX version: {}", mlxr::version());
+fn main() -> mlxcore::Result<()> {
+    println!("MLX version: {}", mlxcore::version());
 
     let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
     println!("shape: {:?}", a.shape());

@@ -1,6 +1,6 @@
 //! Mapping between Rust primitive types and MLX data types.
 
-use mlxr_sys as sys;
+use mlxcore_sys as sys;
 
 mod sealed {
     pub trait Sealed {}

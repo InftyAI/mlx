@@ -12,7 +12,7 @@ use std::fmt;
 use std::ptr;
 use std::sync::Once;
 
-use mlxr_sys as sys;
+use mlxcore_sys as sys;
 
 /// An error returned by an MLX operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
