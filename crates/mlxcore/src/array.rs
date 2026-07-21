@@ -329,14 +329,23 @@ impl Array {
         ) -> i32,
     ) -> Result<Array> {
         error::install();
+        // For an empty slice `as_ptr()` is non-null but dangling; pass an
+        // explicit null pointer so the FFI call never hands C a bogus pointer
+        // even if it were to dereference it with `axes_num == 0`.
+        let axes_ptr = if axes.is_empty() {
+            std::ptr::null()
+        } else {
+            axes.as_ptr()
+        };
         let mut out = unsafe { sys::mlx_array_new() };
-        // SAFETY: `axes`/`axes.len()` describe a valid slice for the duration of
-        // the call; all handles are valid; `op` writes the result into `out`.
+        // SAFETY: `axes_ptr`/`axes.len()` describe a valid slice (or null/0) for
+        // the duration of the call; all handles are valid; `op` writes the
+        // result into `out`.
         let status = unsafe {
             op(
                 &mut out,
                 self.handle,
-                axes.as_ptr(),
+                axes_ptr,
                 axes.len(),
                 keepdims,
                 stream.as_raw(),
