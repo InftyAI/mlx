@@ -602,7 +602,7 @@ mod tests {
         let kept = a.sum_axes(&[1], true, &s).unwrap();
         assert_eq!(kept.shape(), vec![2, 1]);
 
-        // max / min / mean / prod over axis 0.
+        // max / min over axis 0; mean / prod over axis 1.
         assert_eq!(
             a.max_axes(&[0], false, &s).unwrap().to_vec::<f32>(),
             vec![4.0, 5.0, 6.0]
@@ -619,6 +619,17 @@ mod tests {
             a.prod_axes(&[1], false, &s).unwrap().to_vec::<f32>(),
             vec![6.0, 120.0]
         );
+    }
+
+    #[test]
+    fn empty_axes_reduction_is_noop() {
+        // Reducing over no axes must not pass a dangling pointer to C; MLX
+        // treats it as an identity that leaves the values unchanged.
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let r = a.sum_axes(&[], false, &s).unwrap();
+        assert_eq!(r.shape(), vec![2, 2]);
+        assert_eq!(r.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
