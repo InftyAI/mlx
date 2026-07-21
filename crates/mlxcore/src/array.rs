@@ -181,6 +181,46 @@ impl Array {
         self.unary_op(stream, sys::mlx_negative)
     }
 
+    /// Elementwise natural logarithm.
+    pub fn log(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_log)
+    }
+
+    /// Elementwise sine.
+    pub fn sin(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_sin)
+    }
+
+    /// Elementwise cosine.
+    pub fn cos(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_cos)
+    }
+
+    /// Elementwise square.
+    pub fn square(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_square)
+    }
+
+    /// Elementwise hyperbolic tangent.
+    pub fn tanh(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_tanh)
+    }
+
+    /// Elementwise power: `self ** other`.
+    pub fn power(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_power)
+    }
+
+    /// Elementwise maximum of two arrays.
+    pub fn maximum(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_maximum)
+    }
+
+    /// Elementwise minimum of two arrays.
+    pub fn minimum(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_minimum)
+    }
+
     /// Sum of all elements, returning a scalar array.
     ///
     /// With `keepdims == false` the result is 0-dimensional.
@@ -193,6 +233,46 @@ impl Array {
     /// With `keepdims == false` the result is 0-dimensional.
     pub fn mean(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_op(keepdims, stream, sys::mlx_mean)
+    }
+
+    /// Sum over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn sum_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_sum_axes)
+    }
+
+    /// Mean over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn mean_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_mean_axes)
+    }
+
+    /// Maximum over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn max_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_max_axes)
+    }
+
+    /// Minimum over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn min_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_min_axes)
+    }
+
+    /// Product over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn prod_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_prod_axes)
     }
 
     /// Shared plumbing for `res = op(a, b, stream)` binary ops.
@@ -238,6 +318,48 @@ impl Array {
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: handle/stream are valid; `op` writes the result into `out`.
         let status = unsafe { op(&mut out, self.handle, keepdims, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
+    /// Shared plumbing for `res = op(a, axes, axes_num, keepdims, stream)`
+    /// reductions over specific axes.
+    fn reduce_axes_op(
+        &self,
+        axes: &[i32],
+        keepdims: bool,
+        stream: &Stream,
+        op: unsafe extern "C" fn(
+            *mut sys::mlx_array,
+            sys::mlx_array,
+            *const i32,
+            usize,
+            bool,
+            sys::mlx_stream,
+        ) -> i32,
+    ) -> Result<Array> {
+        error::install();
+        // For an empty slice `as_ptr()` is non-null but dangling; pass an
+        // explicit null pointer so the FFI call never hands C a bogus pointer
+        // even if it were to dereference it with `axes_num == 0`.
+        let axes_ptr = if axes.is_empty() {
+            std::ptr::null()
+        } else {
+            axes.as_ptr()
+        };
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: `axes_ptr`/`axes.len()` describe a valid slice (or null/0) for
+        // the duration of the call; all handles are valid; `op` writes the
+        // result into `out`.
+        let status = unsafe {
+            op(
+                &mut out,
+                self.handle,
+                axes_ptr,
+                axes.len(),
+                keepdims,
+                stream.as_raw(),
+            )
+        };
         Self::from_op(out, status)
     }
 
@@ -398,6 +520,48 @@ mod tests {
     }
 
     #[test]
+    fn more_unary_ops() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        assert_eq!(a.square(&s).unwrap().to_vec::<f32>(), vec![1.0, 4.0, 9.0]);
+
+        // log(1) == 0, and log(e) ~= 1.
+        let b = Array::from_slice(&[1.0f32, std::f32::consts::E], &[2]);
+        let logged = b.log(&s).unwrap().to_vec::<f32>();
+        assert!((logged[0]).abs() < 1e-6);
+        assert!((logged[1] - 1.0).abs() < 1e-6);
+
+        // sin(0) == 0, cos(0) == 1, tanh(0) == 0.
+        let z = Array::from_slice(&[0.0f32], &[1]);
+        assert!(z.sin(&s).unwrap().item::<f32>().abs() < 1e-6);
+        assert!((z.cos(&s).unwrap().item::<f32>() - 1.0).abs() < 1e-6);
+        assert!(z.tanh(&s).unwrap().item::<f32>().abs() < 1e-6);
+    }
+
+    #[test]
+    fn more_binary_ops() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = Array::from_slice(&[3.0f32, 2.0, 1.0], &[3]);
+
+        assert_eq!(
+            a.maximum(&b, &s).unwrap().to_vec::<f32>(),
+            vec![3.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            a.minimum(&b, &s).unwrap().to_vec::<f32>(),
+            vec![1.0, 2.0, 1.0]
+        );
+
+        let base = Array::from_slice(&[2.0f32, 3.0], &[2]);
+        let exp = Array::from_slice(&[3.0f32, 2.0], &[2]);
+        assert_eq!(
+            base.power(&exp, &s).unwrap().to_vec::<f32>(),
+            vec![8.0, 9.0]
+        );
+    }
+
+    #[test]
     fn reductions_produce_scalars() {
         let s = Stream::cpu();
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
@@ -416,6 +580,56 @@ mod tests {
         let sum = a.sum(true, &s).unwrap();
         assert_eq!(sum.shape(), vec![1, 1]);
         assert_eq!(sum.item::<f32>(), 10.0);
+    }
+
+    #[test]
+    fn axis_reductions() {
+        let s = Stream::cpu();
+        // [[1, 2, 3],
+        //  [4, 5, 6]]
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // Sum over axis 0 (rows) -> [5, 7, 9], shape [3].
+        let col_sums = a.sum_axes(&[0], false, &s).unwrap();
+        assert_eq!(col_sums.shape(), vec![3]);
+        assert_eq!(col_sums.to_vec::<f32>(), vec![5.0, 7.0, 9.0]);
+
+        // Sum over axis 1 (cols) -> [6, 15], shape [2].
+        let row_sums = a.sum_axes(&[1], false, &s).unwrap();
+        assert_eq!(row_sums.to_vec::<f32>(), vec![6.0, 15.0]);
+
+        // keepdims keeps the reduced axis as size 1.
+        let kept = a.sum_axes(&[1], true, &s).unwrap();
+        assert_eq!(kept.shape(), vec![2, 1]);
+
+        // max / min over axis 0; mean / prod over axis 1.
+        assert_eq!(
+            a.max_axes(&[0], false, &s).unwrap().to_vec::<f32>(),
+            vec![4.0, 5.0, 6.0]
+        );
+        assert_eq!(
+            a.min_axes(&[0], false, &s).unwrap().to_vec::<f32>(),
+            vec![1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            a.mean_axes(&[1], false, &s).unwrap().to_vec::<f32>(),
+            vec![2.0, 5.0]
+        );
+        assert_eq!(
+            a.prod_axes(&[1], false, &s).unwrap().to_vec::<f32>(),
+            vec![6.0, 120.0]
+        );
+    }
+
+    #[test]
+    fn empty_axes_reduction_is_noop() {
+        // Reducing over no axes must not pass a dangling pointer to C; MLX
+        // treats it as an identity that leaves the values unchanged.
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let r = a.sum_axes(&[], false, &s).unwrap();
+        assert_eq!(r.shape(), vec![2, 2]);
+        assert_eq!(r.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
