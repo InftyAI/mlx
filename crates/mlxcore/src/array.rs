@@ -252,16 +252,25 @@ impl Array {
     }
 
     /// Maximum over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
     pub fn max_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_max_axes)
     }
 
     /// Minimum over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
     pub fn min_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_min_axes)
     }
 
     /// Product over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
     pub fn prod_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_prod_axes)
     }
@@ -522,10 +531,11 @@ mod tests {
         assert!((logged[0]).abs() < 1e-6);
         assert!((logged[1] - 1.0).abs() < 1e-6);
 
-        // sin(0) == 0, cos(0) == 1.
+        // sin(0) == 0, cos(0) == 1, tanh(0) == 0.
         let z = Array::from_slice(&[0.0f32], &[1]);
         assert!(z.sin(&s).unwrap().item::<f32>().abs() < 1e-6);
         assert!((z.cos(&s).unwrap().item::<f32>() - 1.0).abs() < 1e-6);
+        assert!(z.tanh(&s).unwrap().item::<f32>().abs() < 1e-6);
     }
 
     #[test]
