@@ -244,6 +244,9 @@ impl Array {
     }
 
     /// Mean over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
     pub fn mean_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_mean_axes)
     }
