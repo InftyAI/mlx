@@ -181,6 +181,46 @@ impl Array {
         self.unary_op(stream, sys::mlx_negative)
     }
 
+    /// Elementwise natural logarithm.
+    pub fn log(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_log)
+    }
+
+    /// Elementwise sine.
+    pub fn sin(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_sin)
+    }
+
+    /// Elementwise cosine.
+    pub fn cos(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_cos)
+    }
+
+    /// Elementwise square.
+    pub fn square(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_square)
+    }
+
+    /// Elementwise hyperbolic tangent.
+    pub fn tanh(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_tanh)
+    }
+
+    /// Elementwise power: `self ** other`.
+    pub fn power(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_power)
+    }
+
+    /// Elementwise maximum of two arrays.
+    pub fn maximum(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_maximum)
+    }
+
+    /// Elementwise minimum of two arrays.
+    pub fn minimum(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_minimum)
+    }
+
     /// Sum of all elements, returning a scalar array.
     ///
     /// With `keepdims == false` the result is 0-dimensional.
@@ -394,6 +434,47 @@ mod tests {
         assert_eq!(
             b.negative(&s).unwrap().to_vec::<f32>(),
             vec![1.0, -2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn more_unary_ops() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        assert_eq!(a.square(&s).unwrap().to_vec::<f32>(), vec![1.0, 4.0, 9.0]);
+
+        // log(1) == 0, and log(e) ~= 1.
+        let b = Array::from_slice(&[1.0f32, std::f32::consts::E], &[2]);
+        let logged = b.log(&s).unwrap().to_vec::<f32>();
+        assert!((logged[0]).abs() < 1e-6);
+        assert!((logged[1] - 1.0).abs() < 1e-6);
+
+        // sin(0) == 0, cos(0) == 1.
+        let z = Array::from_slice(&[0.0f32], &[1]);
+        assert!(z.sin(&s).unwrap().item::<f32>().abs() < 1e-6);
+        assert!((z.cos(&s).unwrap().item::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn more_binary_ops() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = Array::from_slice(&[3.0f32, 2.0, 1.0], &[3]);
+
+        assert_eq!(
+            a.maximum(&b, &s).unwrap().to_vec::<f32>(),
+            vec![3.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            a.minimum(&b, &s).unwrap().to_vec::<f32>(),
+            vec![1.0, 2.0, 1.0]
+        );
+
+        let base = Array::from_slice(&[2.0f32, 3.0], &[2]);
+        let exp = Array::from_slice(&[3.0f32, 2.0], &[2]);
+        assert_eq!(
+            base.power(&exp, &s).unwrap().to_vec::<f32>(),
+            vec![8.0, 9.0]
         );
     }
 
