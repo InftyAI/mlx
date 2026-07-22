@@ -121,7 +121,8 @@ impl Array {
     /// (row-major) element order rather than the raw storage buffer.
     ///
     /// # Panics
-    /// Panics if `T::DTYPE` does not match the array's dtype.
+    /// Panics if `T::DTYPE` does not match the array's dtype, or if
+    /// making the array contiguous fails.
     pub fn to_vec<T: ArrayElement>(&self) -> Vec<T> {
         // Materialize a row-contiguous copy: strided views (transpose) and
         // stride-0 views (broadcast) don't lay their logical elements out
