@@ -78,6 +78,36 @@ impl Array {
         (0..ndim).map(|i| unsafe { *ptr.add(i) }).collect()
     }
 
+    /// Strides of the array, in elements (not bytes), one per dimension.
+    pub fn strides(&self) -> Vec<usize> {
+        let ndim = self.ndim();
+        // SAFETY: mlx guarantees the returned pointer is valid for `ndim`
+        // `size_t`s.
+        let ptr = unsafe { sys::mlx_array_strides(self.handle) };
+        (0..ndim).map(|i| unsafe { *ptr.add(i) }).collect()
+    }
+
+    /// Whether the array is laid out row-major (C-order) contiguously.
+    ///
+    /// Computed from the public shape + strides, so a raw read of the storage
+    /// buffer yields elements in logical row-major order iff this is true.
+    fn is_row_contiguous(&self) -> bool {
+        let shape = self.shape();
+        let strides = self.strides();
+        // Expected row-major stride for axis i is the product of all later
+        // dimensions. Walk from the last axis, tracking that running product.
+        // Size-1 axes impose no constraint (any stride works), so skip them.
+        let mut expected: usize = 1;
+        for i in (0..shape.len()).rev() {
+            let dim = shape[i] as usize;
+            if dim != 1 && strides[i] != expected {
+                return false;
+            }
+            expected *= dim;
+        }
+        true
+    }
+
     /// Forces evaluation of this array.
     ///
     /// MLX is lazy: ops build a graph and only compute when the result is
@@ -115,7 +145,8 @@ impl Array {
     /// The element type `T` selects the accessor at compile time, e.g.
     /// `a.to_vec::<f32>()`. Evaluates the array first.
     ///
-    /// Non-contiguous arrays (e.g. from [`transpose`](Self::transpose) or
+    /// Row-contiguous arrays are read directly from their storage buffer.
+    /// Non-contiguous ones (e.g. from [`transpose`](Self::transpose) or
     /// [`broadcast_to`](Self::broadcast_to)) are first materialized into a
     /// row-contiguous copy, so the result always reflects the logical
     /// (row-major) element order rather than the raw storage buffer.
@@ -124,11 +155,16 @@ impl Array {
     /// Panics if `T::DTYPE` does not match the array's dtype, or if
     /// making the array contiguous fails.
     pub fn to_vec<T: ArrayElement>(&self) -> Vec<T> {
-        // Materialize a row-contiguous copy: strided views (transpose) and
-        // stride-0 views (broadcast) don't lay their logical elements out
-        // contiguously in the storage buffer, so reading the raw pointer would
-        // return storage order (or read past the real data). `mlx_contiguous`
-        // produces a dense buffer whose memory order matches the logical order.
+        self.eval();
+        // Fast path: already row-major, so the storage buffer is already in
+        // logical order — read it directly, no copy.
+        if self.is_row_contiguous() {
+            return self.read_buffer::<T>();
+        }
+        // Slow path: strided views (transpose) and stride-0 views (broadcast)
+        // don't lay their logical elements out contiguously, so reading the raw
+        // pointer would return storage order (or read past real data). Only
+        // these pay for a materialized copy.
         //
         // Run it on the CPU stream: this is a host-side data-marshalling step
         // (we're about to read the buffer from Rust), and it keeps `to_vec` off
@@ -137,25 +173,33 @@ impl Array {
             panic!("to_vec: failed to make array contiguous: {e}");
         });
         contiguous.eval();
+        contiguous.read_buffer::<T>()
+    }
 
+    /// Bulk-copies a **row-contiguous** array's storage buffer into a `Vec<T>`.
+    ///
+    /// # Panics
+    /// Panics if `T::DTYPE` does not match the array's dtype. Assumes the array
+    /// is already evaluated and row-contiguous.
+    fn read_buffer<T: ArrayElement>(&self) -> Vec<T> {
         // SAFETY: mlx_array_dtype reads a valid handle.
-        let dtype = unsafe { sys::mlx_array_dtype(contiguous.handle) };
+        let dtype = unsafe { sys::mlx_array_dtype(self.handle) };
         assert_eq!(
             dtype,
             T::DTYPE,
             "array dtype does not match requested element type"
         );
-        let len = contiguous.size();
+        let len = self.size();
         // `from_raw_parts` requires a non-null, aligned pointer even for a
         // zero-length slice, but mlx may return null for an empty array.
         if len == 0 {
             return Vec::new();
         }
-        // SAFETY: dtype matches `T` (checked above) and `contiguous` is dense,
-        // so mlx guarantees `len` contiguous, aligned `T` at `ptr`, valid until
-        // `contiguous` is dropped at the end of this function. We copy out of
-        // the slice before that. `T: Copy`, so this is a single bulk copy.
-        let ptr = unsafe { T::data_ptr(contiguous.handle) };
+        // SAFETY: dtype matches `T` (checked above) and the array is dense, so
+        // mlx guarantees `len` contiguous, aligned `T` at `ptr`, valid until the
+        // array is mutated or freed. We copy out of the slice within this call.
+        // `T: Copy`, so this is a single bulk copy.
+        let ptr = unsafe { T::data_ptr(self.handle) };
         unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
     }
 
@@ -734,6 +778,19 @@ mod tests {
         let r = a.reshape(&[3, 2], &s).unwrap();
         assert_eq!(r.shape(), vec![3, 2]);
         assert_eq!(r.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn row_contiguity_detection() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        // Freshly built arrays are row-contiguous (fast path in to_vec).
+        assert!(a.is_row_contiguous());
+        // A transpose is a strided view. Strides only reflect the real layout
+        // after evaluation (MLX is lazy), which is exactly when to_vec checks.
+        let t = a.transpose(&s).unwrap();
+        t.eval();
+        assert!(!t.is_row_contiguous());
     }
 
     #[test]
