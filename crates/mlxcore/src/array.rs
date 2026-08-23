@@ -16,6 +16,20 @@ pub struct Array {
     handle: sys::mlx_array,
 }
 
+/// Returns a pointer to `slice`'s data, or null when it is empty.
+///
+/// For an empty slice `as_ptr()` is non-null but dangling. The mlx-c functions
+/// we call take a `(ptr, len)` pair and build a container from it, so they never
+/// dereference the pointer when `len == 0` — but passing an explicit null keeps
+/// a dangling pointer from crossing the FFI boundary at all.
+fn as_ffi_ptr<T>(slice: &[T]) -> *const T {
+    if slice.is_empty() {
+        std::ptr::null()
+    } else {
+        slice.as_ptr()
+    }
+}
+
 impl Array {
     /// Creates an `Array` from a raw handle, taking ownership of it.
     ///
@@ -46,17 +60,77 @@ impl Array {
             data.len()
         );
         error::install();
-        // SAFETY: pointers/len are valid for the duration of the call; mlx
-        // copies the data into its own buffer.
-        let handle = unsafe {
-            sys::mlx_array_new_data(
-                data.as_ptr() as *const _,
-                shape.as_ptr(),
-                shape.len() as i32,
+        // Both empty cases are reachable here: an empty `shape` for a 0-d
+        // scalar, empty `data` for a 0-element array.
+        let data_ptr = as_ffi_ptr(data) as *const _;
+        let shape_ptr = as_ffi_ptr(shape);
+        // SAFETY: pointers/len describe valid slices (or null/0) for the
+        // duration of the call; mlx copies the data into its own buffer.
+        let handle =
+            unsafe { sys::mlx_array_new_data(data_ptr, shape_ptr, shape.len() as i32, T::DTYPE) };
+        unsafe { Self::from_raw(handle) }
+    }
+
+    /// Builds a 0-dimensional array holding a single value.
+    ///
+    /// The dtype follows the value's type, so `Array::from_scalar(2.0f32)` is a
+    /// `float32` scalar. Handy as the operand of a broadcasting op.
+    pub fn from_scalar<T: ArrayElement>(value: T) -> Self {
+        Self::from_slice(&[value], &[])
+    }
+
+    /// An array of `shape` filled with zeros, with the dtype chosen by `T`.
+    ///
+    /// Call as `Array::zeros::<f32>(&[2, 3], &stream)`.
+    pub fn zeros<T: ArrayElement>(shape: &[i32], stream: &Stream) -> Result<Array> {
+        Self::fill_op(shape, T::DTYPE, stream, sys::mlx_zeros)
+    }
+
+    /// An array of `shape` filled with ones, with the dtype chosen by `T`.
+    ///
+    /// Call as `Array::ones::<f32>(&[2, 3], &stream)`.
+    pub fn ones<T: ArrayElement>(shape: &[i32], stream: &Stream) -> Result<Array> {
+        Self::fill_op(shape, T::DTYPE, stream, sys::mlx_ones)
+    }
+
+    /// An array of `shape` filled with `value`, with the dtype chosen by `T`.
+    pub fn full<T: ArrayElement>(shape: &[i32], value: T, stream: &Stream) -> Result<Array> {
+        error::install();
+        // Held in a local so it outlives the call below.
+        let vals = Self::from_scalar(value);
+        let shape_ptr = as_ffi_ptr(shape);
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: `shape_ptr`/`shape.len()` describe a valid slice (or null/0);
+        // all handles are valid; the result is written into `out`.
+        let status = unsafe {
+            sys::mlx_full(
+                &mut out,
+                shape_ptr,
+                shape.len(),
+                vals.as_raw(),
                 T::DTYPE,
+                stream.as_raw(),
             )
         };
-        unsafe { Self::from_raw(handle) }
+        Self::from_op(out, status)
+    }
+
+    /// Values from `start` (inclusive) to `stop` (exclusive), stepping by `step`.
+    ///
+    /// The bounds are `f64` because MLX's are; they are cast to the dtype chosen
+    /// by `T`, as in `Array::arange::<i32>(0.0, 5.0, 1.0, &stream)`.
+    pub fn arange<T: ArrayElement>(
+        start: f64,
+        stop: f64,
+        step: f64,
+        stream: &Stream,
+    ) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: stream is valid; the result is written into `out`.
+        let status =
+            unsafe { sys::mlx_arange(&mut out, start, stop, step, T::DTYPE, stream.as_raw()) };
+        Self::from_op(out, status)
     }
 
     /// Total number of elements.
@@ -378,6 +452,29 @@ impl Array {
         Self::from_op(out, status)
     }
 
+    /// Shared plumbing for `res = op(shape, shape_num, dtype, stream)`
+    /// constructors.
+    fn fill_op(
+        shape: &[i32],
+        dtype: sys::mlx_dtype,
+        stream: &Stream,
+        op: unsafe extern "C" fn(
+            *mut sys::mlx_array,
+            *const i32,
+            usize,
+            sys::mlx_dtype,
+            sys::mlx_stream,
+        ) -> i32,
+    ) -> Result<Array> {
+        error::install();
+        let shape_ptr = as_ffi_ptr(shape);
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: `shape_ptr`/`shape.len()` describe a valid slice (or null/0);
+        // stream is valid; `op` writes the result into `out`.
+        let status = unsafe { op(&mut out, shape_ptr, shape.len(), dtype, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
     /// Shared plumbing for `res = op(a, shape, shape_num, stream)` shape ops.
     fn shape_op(
         &self,
@@ -392,13 +489,7 @@ impl Array {
         ) -> i32,
     ) -> Result<Array> {
         error::install();
-        // For an empty slice `as_ptr()` is non-null but dangling; pass an
-        // explicit null pointer so C never receives a bogus pointer.
-        let shape_ptr = if shape.is_empty() {
-            std::ptr::null()
-        } else {
-            shape.as_ptr()
-        };
+        let shape_ptr = as_ffi_ptr(shape);
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: `shape_ptr`/`shape.len()` describe a valid slice (or null/0)
         // for the call; all handles are valid; `op` writes into `out`.
@@ -477,14 +568,7 @@ impl Array {
         ) -> i32,
     ) -> Result<Array> {
         error::install();
-        // For an empty slice `as_ptr()` is non-null but dangling; pass an
-        // explicit null pointer so the FFI call never hands C a bogus pointer
-        // even if it were to dereference it with `axes_num == 0`.
-        let axes_ptr = if axes.is_empty() {
-            std::ptr::null()
-        } else {
-            axes.as_ptr()
-        };
+        let axes_ptr = as_ffi_ptr(axes);
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: `axes_ptr`/`axes.len()` describe a valid slice (or null/0) for
         // the duration of the call; all handles are valid; `op` writes the
@@ -607,6 +691,78 @@ mod tests {
         assert_eq!(a.ndim(), 0);
         assert_eq!(a.size(), 1);
         assert!(a.shape().is_empty());
+    }
+
+    #[test]
+    fn from_scalar_is_zero_dim() {
+        let a = Array::from_scalar(42.0f32);
+        assert_eq!(a.ndim(), 0);
+        assert_eq!(a.item::<f32>(), 42.0);
+    }
+
+    #[test]
+    fn empty_array_has_no_elements() {
+        // Exercises the null-pointer path for empty `data`.
+        let a = Array::from_slice::<f32>(&[], &[0]);
+        assert_eq!(a.size(), 0);
+        assert_eq!(a.shape(), vec![0]);
+        assert!(a.to_vec::<f32>().is_empty());
+    }
+
+    #[test]
+    fn zeros_and_ones_fill_shape() {
+        let s = Stream::cpu();
+
+        let z = Array::zeros::<f32>(&[2, 3], &s).unwrap();
+        assert_eq!(z.shape(), vec![2, 3]);
+        assert_eq!(z.to_vec::<f32>(), vec![0.0; 6]);
+
+        let o = Array::ones::<f32>(&[2, 2], &s).unwrap();
+        assert_eq!(o.to_vec::<f32>(), vec![1.0; 4]);
+
+        // The type parameter picks the dtype, so integer arrays work too.
+        let i = Array::ones::<i32>(&[3], &s).unwrap();
+        assert_eq!(i.to_vec::<i32>(), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn full_broadcasts_a_scalar() {
+        let s = Stream::cpu();
+        let a = Array::full(&[2, 2], 7.5f32, &s).unwrap();
+        assert_eq!(a.shape(), vec![2, 2]);
+        assert_eq!(a.to_vec::<f32>(), vec![7.5; 4]);
+
+        // An empty shape yields a 0-d array, not an error.
+        let scalar = Array::full(&[], 3i32, &s).unwrap();
+        assert_eq!(scalar.ndim(), 0);
+        assert_eq!(scalar.item::<i32>(), 3);
+    }
+
+    #[test]
+    fn arange_is_half_open() {
+        let s = Stream::cpu();
+        // `stop` is exclusive, so this is 0..5, not 0..=5.
+        let a = Array::arange::<i32>(0.0, 5.0, 1.0, &s).unwrap();
+        assert_eq!(a.to_vec::<i32>(), vec![0, 1, 2, 3, 4]);
+
+        let f = Array::arange::<f32>(1.0, 2.0, 0.5, &s).unwrap();
+        assert_eq!(f.to_vec::<f32>(), vec![1.0, 1.5]);
+    }
+
+    #[test]
+    fn constructors_compose_with_ops() {
+        let s = Stream::cpu();
+        // ones + ones == twos, over a shape built by a constructor.
+        let o = Array::ones::<f32>(&[4], &s).unwrap();
+        assert_eq!(o.add(&o, &s).unwrap().to_vec::<f32>(), vec![2.0; 4]);
+
+        // A 0-d scalar broadcasts against a larger array.
+        let a = Array::arange::<f32>(0.0, 4.0, 1.0, &s).unwrap();
+        let two = Array::from_scalar(2.0f32);
+        assert_eq!(
+            a.multiply(&two, &s).unwrap().to_vec::<f32>(),
+            vec![0.0, 2.0, 4.0, 6.0]
+        );
     }
 
     #[test]
