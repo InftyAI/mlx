@@ -78,6 +78,36 @@ impl Array {
         (0..ndim).map(|i| unsafe { *ptr.add(i) }).collect()
     }
 
+    /// Strides of the array, in elements (not bytes), one per dimension.
+    pub fn strides(&self) -> Vec<usize> {
+        let ndim = self.ndim();
+        // SAFETY: mlx guarantees the returned pointer is valid for `ndim`
+        // `size_t`s.
+        let ptr = unsafe { sys::mlx_array_strides(self.handle) };
+        (0..ndim).map(|i| unsafe { *ptr.add(i) }).collect()
+    }
+
+    /// Whether the array is laid out row-major (C-order) contiguously.
+    ///
+    /// Computed from the public shape + strides, so a raw read of the storage
+    /// buffer yields elements in logical row-major order iff this is true.
+    fn is_row_contiguous(&self) -> bool {
+        let shape = self.shape();
+        let strides = self.strides();
+        // Expected row-major stride for axis i is the product of all later
+        // dimensions. Walk from the last axis, tracking that running product.
+        // Size-1 axes impose no constraint (any stride works), so skip them.
+        let mut expected: usize = 1;
+        for i in (0..shape.len()).rev() {
+            let dim = shape[i] as usize;
+            if dim != 1 && strides[i] != expected {
+                return false;
+            }
+            expected *= dim;
+        }
+        true
+    }
+
     /// Forces evaluation of this array.
     ///
     /// MLX is lazy: ops build a graph and only compute when the result is
@@ -115,10 +145,43 @@ impl Array {
     /// The element type `T` selects the accessor at compile time, e.g.
     /// `a.to_vec::<f32>()`. Evaluates the array first.
     ///
+    /// Row-contiguous arrays are read directly from their storage buffer.
+    /// Non-contiguous ones (e.g. from [`transpose`](Self::transpose) or
+    /// [`broadcast_to`](Self::broadcast_to)) are first materialized into a
+    /// row-contiguous copy, so the result always reflects the logical
+    /// (row-major) element order rather than the raw storage buffer.
+    ///
     /// # Panics
-    /// Panics if `T::DTYPE` does not match the array's dtype.
+    /// Panics if `T::DTYPE` does not match the array's dtype, or if
+    /// making the array contiguous fails.
     pub fn to_vec<T: ArrayElement>(&self) -> Vec<T> {
         self.eval();
+        // Fast path: already row-major, so the storage buffer is already in
+        // logical order — read it directly, no copy.
+        if self.is_row_contiguous() {
+            return self.read_buffer::<T>();
+        }
+        // Slow path: strided views (transpose) and stride-0 views (broadcast)
+        // don't lay their logical elements out contiguously, so reading the raw
+        // pointer would return storage order (or read past real data). Only
+        // these pay for a materialized copy.
+        //
+        // Run it on the CPU stream: this is a host-side data-marshalling step
+        // (we're about to read the buffer from Rust), and it keeps `to_vec` off
+        // the GPU stream so concurrent callers don't contend on Metal.
+        let contiguous = self.contiguous(&Stream::cpu()).unwrap_or_else(|e| {
+            panic!("to_vec: failed to make array contiguous: {e}");
+        });
+        contiguous.eval();
+        contiguous.read_buffer::<T>()
+    }
+
+    /// Bulk-copies a **row-contiguous** array's storage buffer into a `Vec<T>`.
+    ///
+    /// # Panics
+    /// Panics if `T::DTYPE` does not match the array's dtype. Assumes the array
+    /// is already evaluated and row-contiguous.
+    fn read_buffer<T: ArrayElement>(&self) -> Vec<T> {
         // SAFETY: mlx_array_dtype reads a valid handle.
         let dtype = unsafe { sys::mlx_array_dtype(self.handle) };
         assert_eq!(
@@ -132,13 +195,22 @@ impl Array {
         if len == 0 {
             return Vec::new();
         }
-        // SAFETY: dtype matches `T` (checked above), so mlx guarantees `len`
-        // contiguous, aligned `T` at `ptr`, valid until the array is mutated or
-        // freed. We only read (and copy out of) the slice within this call, so
-        // the borrow cannot outlive the buffer. `T: Copy`, so `to_vec` is a
-        // single bulk copy rather than `len` individual derefs.
+        // SAFETY: dtype matches `T` (checked above) and the array is dense, so
+        // mlx guarantees `len` contiguous, aligned `T` at `ptr`, valid until the
+        // array is mutated or freed. We copy out of the slice within this call.
+        // `T: Copy`, so this is a single bulk copy.
         let ptr = unsafe { T::data_ptr(self.handle) };
         unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    }
+
+    /// Returns a row-contiguous copy (or the same array if already dense).
+    pub fn contiguous(&self, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream valid; `allow_col_major = false` forces
+        // row-major; result written into `out`.
+        let status = unsafe { sys::mlx_contiguous(&mut out, self.handle, false, stream.as_raw()) };
+        Self::from_op(out, status)
     }
 
     /// Elementwise addition: `self + other`.
@@ -273,6 +345,73 @@ impl Array {
     /// are kept with size 1.
     pub fn prod_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_prod_axes)
+    }
+
+    /// Returns a new array with the same data reinterpreted as `shape`.
+    ///
+    /// The product of `shape` must equal [`size`](Self::size).
+    pub fn reshape(&self, shape: &[i32], stream: &Stream) -> Result<Array> {
+        self.shape_op(shape, stream, sys::mlx_reshape)
+    }
+
+    /// Broadcasts the array to `shape`.
+    pub fn broadcast_to(&self, shape: &[i32], stream: &Stream) -> Result<Array> {
+        self.shape_op(shape, stream, sys::mlx_broadcast_to)
+    }
+
+    /// Reverses the order of all axes (a full transpose).
+    pub fn transpose(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_transpose)
+    }
+
+    /// Removes all axes of length 1.
+    pub fn squeeze(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_squeeze)
+    }
+
+    /// Inserts a new axis of length 1 at position `axis`.
+    pub fn expand_dims(&self, axis: i32, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; `mlx_expand_dims` writes the result into `out`.
+        let status = unsafe { sys::mlx_expand_dims(&mut out, self.handle, axis, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
+    /// Shared plumbing for `res = op(a, shape, shape_num, stream)` shape ops.
+    fn shape_op(
+        &self,
+        shape: &[i32],
+        stream: &Stream,
+        op: unsafe extern "C" fn(
+            *mut sys::mlx_array,
+            sys::mlx_array,
+            *const i32,
+            usize,
+            sys::mlx_stream,
+        ) -> i32,
+    ) -> Result<Array> {
+        error::install();
+        // For an empty slice `as_ptr()` is non-null but dangling; pass an
+        // explicit null pointer so C never receives a bogus pointer.
+        let shape_ptr = if shape.is_empty() {
+            std::ptr::null()
+        } else {
+            shape.as_ptr()
+        };
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: `shape_ptr`/`shape.len()` describe a valid slice (or null/0)
+        // for the call; all handles are valid; `op` writes into `out`.
+        let status = unsafe {
+            op(
+                &mut out,
+                self.handle,
+                shape_ptr,
+                shape.len(),
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
     }
 
     /// Shared plumbing for `res = op(a, b, stream)` binary ops.
@@ -630,6 +769,59 @@ mod tests {
         let r = a.sum_axes(&[], false, &s).unwrap();
         assert_eq!(r.shape(), vec![2, 2]);
         assert_eq!(r.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn reshape_changes_shape_not_data() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let r = a.reshape(&[3, 2], &s).unwrap();
+        assert_eq!(r.shape(), vec![3, 2]);
+        assert_eq!(r.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn row_contiguity_detection() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        // Freshly built arrays are row-contiguous (fast path in to_vec).
+        assert!(a.is_row_contiguous());
+        // A transpose is a strided view. Strides only reflect the real layout
+        // after evaluation (MLX is lazy), which is exactly when to_vec checks.
+        let t = a.transpose(&s).unwrap();
+        t.eval();
+        assert!(!t.is_row_contiguous());
+    }
+
+    #[test]
+    fn transpose_reverses_axes() {
+        let s = Stream::cpu();
+        // [[1, 2, 3],
+        //  [4, 5, 6]]  ->  [[1, 4], [2, 5], [3, 6]]
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let t = a.transpose(&s).unwrap();
+        assert_eq!(t.shape(), vec![3, 2]);
+        assert_eq!(t.to_vec::<f32>(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn broadcast_to_expands() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = a.broadcast_to(&[2, 3], &s).unwrap();
+        assert_eq!(b.shape(), vec![2, 3]);
+        assert_eq!(b.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn squeeze_and_expand_dims() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 3, 1]);
+        let sq = a.squeeze(&s).unwrap();
+        assert_eq!(sq.shape(), vec![3]);
+
+        let ex = sq.expand_dims(0, &s).unwrap();
+        assert_eq!(ex.shape(), vec![1, 3]);
     }
 
     #[test]
