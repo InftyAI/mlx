@@ -373,7 +373,7 @@ impl Array {
     pub fn expand_dims(&self, axis: i32, stream: &Stream) -> Result<Array> {
         error::install();
         let mut out = unsafe { sys::mlx_array_new() };
-        // SAFETY: handle/stream are valid; `op` writes the result into `out`.
+        // SAFETY: handle/stream are valid; `mlx_expand_dims` writes the result into `out`.
         let status = unsafe { sys::mlx_expand_dims(&mut out, self.handle, axis, stream.as_raw()) };
         Self::from_op(out, status)
     }
