@@ -695,6 +695,96 @@ impl std::ops::Neg for &Array {
     }
 }
 
+// Scalar operands, so `&a * 2.0f32` needs no hand-built 1-element array. The
+// scalar becomes a 0-dimensional array that broadcasts across `self`.
+//
+// The scalar's *Rust* type picks its dtype, and MLX then promotes the result to
+// the wider of the two. That makes an unsuffixed float literal a trap: `&a * 2.0`
+// infers `f64` (Rust's float fallback), so an `f32` array silently widens to
+// `float64`. Write `&a * 2.0f32` to stay in single precision.
+//
+// Same panic-on-error contract as the array-to-array operators above.
+macro_rules! impl_scalar_rhs_binop {
+    ($($trait:ident :: $method:ident => $op:ident),* $(,)?) => {
+        $(
+            impl<T: ArrayElement> std::ops::$trait<T> for &Array {
+                type Output = Array;
+                fn $method(self, rhs: T) -> Array {
+                    self.$op(&Array::from_scalar(rhs), &Stream::default())
+                        .unwrap_or_else(|e| {
+                            panic!(concat!("Array::", stringify!($op), " failed: {}"), e)
+                        })
+                }
+            }
+        )*
+    };
+}
+
+impl_scalar_rhs_binop! {
+    Add::add => add,
+    Sub::sub => subtract,
+    Mul::mul => multiply,
+    Div::div => divide,
+}
+
+/// Applies `op(scalar, rhs)` on the default stream, panicking on failure.
+///
+/// Shared by the scalar-on-the-left operator impls below, which cannot be
+/// written as one blanket impl (see the comment on [`impl_scalar_lhs_binop`]).
+fn scalar_lhs_op<T: ArrayElement>(
+    lhs: T,
+    rhs: &Array,
+    op: fn(&Array, &Array, &Stream) -> Result<Array>,
+    name: &str,
+) -> Array {
+    let lhs = Array::from_scalar(lhs);
+    op(&lhs, rhs, &Stream::default()).unwrap_or_else(|e| panic!("Array::{name} failed: {e}"))
+}
+
+// The mirror of the impls above, for `2.0f32 * &a`. Worth having because `Sub`
+// and `Div` are not commutative: `10.0 - &a` cannot be spelled with the
+// scalar-on-the-right impls.
+//
+// These cannot be one blanket `impl<T: ArrayElement> Add<&Array> for T` — that
+// implements a foreign trait for an uncovered type parameter, which coherence
+// forbids (E0210). So they are generated per concrete element type instead.
+macro_rules! impl_scalar_lhs_binop {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl std::ops::Add<&Array> for $ty {
+                type Output = Array;
+                fn add(self, rhs: &Array) -> Array {
+                    scalar_lhs_op(self, rhs, Array::add, "add")
+                }
+            }
+
+            impl std::ops::Sub<&Array> for $ty {
+                type Output = Array;
+                fn sub(self, rhs: &Array) -> Array {
+                    scalar_lhs_op(self, rhs, Array::subtract, "subtract")
+                }
+            }
+
+            impl std::ops::Mul<&Array> for $ty {
+                type Output = Array;
+                fn mul(self, rhs: &Array) -> Array {
+                    scalar_lhs_op(self, rhs, Array::multiply, "multiply")
+                }
+            }
+
+            impl std::ops::Div<&Array> for $ty {
+                type Output = Array;
+                fn div(self, rhs: &Array) -> Array {
+                    scalar_lhs_op(self, rhs, Array::divide, "divide")
+                }
+            }
+        )*
+    };
+}
+
+// Every type with an `ArrayElement` impl, so the two directions stay symmetric.
+impl_scalar_lhs_binop!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +1012,85 @@ mod tests {
         assert!(
             !err.message().is_empty(),
             "expected a message from mlx, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_on_the_right() {
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        assert_eq!((&a * 2.0f32).to_vec::<f32>(), vec![2.0, 4.0, 6.0]);
+        assert_eq!((&a + 1.0f32).to_vec::<f32>(), vec![2.0, 3.0, 4.0]);
+        assert_eq!((&a - 1.0f32).to_vec::<f32>(), vec![0.0, 1.0, 2.0]);
+        assert_eq!((&a / 2.0f32).to_vec::<f32>(), vec![0.5, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn scalar_on_the_left() {
+        let a = Array::from_slice(&[1.0f32, 2.0, 4.0], &[3]);
+        // Commutative ops match the right-hand form...
+        assert_eq!((2.0f32 * &a).to_vec::<f32>(), (&a * 2.0f32).to_vec::<f32>());
+        assert_eq!((1.0f32 + &a).to_vec::<f32>(), vec![2.0, 3.0, 5.0]);
+        // ...and the non-commutative ones are why these impls exist.
+        assert_eq!((10.0f32 - &a).to_vec::<f32>(), vec![9.0, 8.0, 6.0]);
+        assert_eq!((8.0f32 / &a).to_vec::<f32>(), vec![8.0, 4.0, 2.0]);
+    }
+
+    #[test]
+    fn integer_scalars_keep_integer_dtype() {
+        let a = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let doubled = &a * 2i32;
+        assert_eq!(doubled.to_vec::<i32>(), vec![2, 4, 6]);
+        assert_eq!((2i32 * &a).to_vec::<i32>(), vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn suffixed_scalar_keeps_the_array_dtype() {
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let kept = &a * 2.0f32;
+        assert!(
+            format!("{kept:?}").contains("float32"),
+            "expected float32, got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn unsuffixed_float_scalar_widens_to_float64() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        // An unsuffixed literal infers `f64` (Rust's float fallback), and MLX
+        // promotes the result to the wider dtype.
+        let widened = a.multiply(&Array::from_scalar(2.0), &s).unwrap();
+        assert!(
+            format!("{widened:?}").contains("float64"),
+            "expected float64, got {widened:?}"
+        );
+    }
+
+    #[test]
+    fn float64_is_rejected_on_the_gpu() {
+        // Why the widening above matters: Metal has no float64. Checked through
+        // the method API so the failure is an `Err` rather than a panic raised
+        // in the middle of GPU encoding.
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let err = a
+            .multiply(&Array::from_scalar(2.0), &Stream::gpu())
+            .unwrap_err();
+        assert!(
+            err.message().contains("float64"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn scalar_ops_broadcast_over_any_shape() {
+        // The scalar is 0-dimensional, so it broadcasts regardless of rank.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let scaled = &a * 10.0f32;
+        assert_eq!(scaled.shape(), vec![2, 3]);
+        assert_eq!(
+            scaled.to_vec::<f32>(),
+            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
         );
     }
 
