@@ -36,6 +36,9 @@ impl Array {
     /// The MLX dtype is chosen from the element type `T` at compile time (e.g.
     /// `&[f32]` produces a `float32` array, `&[i32]` an `int32` array).
     ///
+    /// Suffix float literals: `&[1.0, 2.0]` infers `f64`, and float64 is not
+    /// supported on the GPU. Write `&[1.0f32, 2.0]`.
+    ///
     /// # Panics
     /// Panics if `data.len()` does not equal the product of `shape`.
     pub fn from_slice<T: ArrayElement>(data: &[T], shape: &[i32]) -> Self {
@@ -698,10 +701,8 @@ impl std::ops::Neg for &Array {
 // Scalar operands, so `&a * 2.0f32` needs no hand-built 1-element array. The
 // scalar becomes a 0-dimensional array that broadcasts across `self`.
 //
-// The scalar's *Rust* type picks its dtype, and MLX then promotes the result to
-// the wider of the two. That makes an unsuffixed float literal a trap: `&a * 2.0`
-// infers `f64` (Rust's float fallback), so an `f32` array silently widens to
-// `float64`. Write `&a * 2.0f32` to stay in single precision.
+// Suffix the literal: the scalar's Rust type picks its dtype and MLX promotes to
+// the wider one, so `&a * 2.0` widens to float64, which the GPU rejects.
 //
 // Same panic-on-error contract as the array-to-array operators above.
 macro_rules! impl_scalar_rhs_binop {

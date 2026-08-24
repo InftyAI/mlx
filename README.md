@@ -38,6 +38,14 @@ Runnable examples live in `crates/mlxcore/examples`:
 cargo run --example hello
 ```
 
+## Note: suffix float literals with `f32`
+
+Unsuffixed float literals are `f64` in Rust, and Apple GPUs have no float64
+support. Since the default stream is the GPU, `&[1.0, 2.0]` builds an array that
+fails on every operation. Write `&[1.0f32, 2.0]`, and `&a * 2.0f32` for scalars.
+
+float64 still works on an explicit `Stream::cpu()`.
+
 ## Features
 
 - `metal` (default) — GPU backend via Metal.
