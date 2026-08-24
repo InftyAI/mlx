@@ -277,6 +277,28 @@ impl Array {
         unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
     }
 
+    /// Converts the elements to the dtype chosen by `T`.
+    ///
+    /// Call as `a.astype::<f32>(&stream)`. This is the only way to change an
+    /// array's dtype — it is otherwise fixed by whichever constructor built the
+    /// array. Note that binary ops already promote mixed dtypes on their own
+    /// (`int32 + float32` yields `float32`), so this is for *explicit* control.
+    ///
+    /// Conversions follow C++ cast semantics rather than Rust's, and never
+    /// error: float-to-integer truncates toward zero (`2.7` becomes `2`),
+    /// `bool` becomes 0 or 1, and numeric-to-`bool` tests `!= 0`. Converting a
+    /// float that is out of the target integer's range is *unspecified*.
+    ///
+    /// Only dtypes with an [`ArrayElement`] impl can be targeted, so MLX's
+    /// `float16`, `bfloat16`, and `complex64` are out of reach for now.
+    pub fn astype<T: ArrayElement>(&self, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; the result is written into `out`.
+        let status = unsafe { sys::mlx_astype(&mut out, self.handle, T::DTYPE, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
     /// Returns a row-contiguous copy (or the same array if already dense).
     pub fn contiguous(&self, stream: &Stream) -> Result<Array> {
         error::install();
@@ -763,6 +785,48 @@ mod tests {
             a.multiply(&two, &s).unwrap().to_vec::<f32>(),
             vec![0.0, 2.0, 4.0, 6.0]
         );
+    }
+
+    #[test]
+    fn astype_converts_dtype() {
+        let s = Stream::cpu();
+        let ints = Array::from_slice(&[1i32, 2, 3], &[3]);
+
+        // Reading as f32 is only possible after converting.
+        let floats = ints.astype::<f32>(&s).unwrap();
+        assert_eq!(floats.to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+        // The original is untouched: astype returns a new array.
+        assert_eq!(ints.to_vec::<i32>(), vec![1, 2, 3]);
+        // Shape is preserved; only the dtype changes.
+        assert_eq!(floats.shape(), ints.shape());
+    }
+
+    #[test]
+    fn astype_narrowing_truncates_toward_zero() {
+        let s = Stream::cpu();
+        // C++ cast semantics: truncation, not rounding, and no error.
+        let a = Array::from_slice(&[2.7f32, -2.7, 0.9], &[3]);
+        assert_eq!(a.astype::<i32>(&s).unwrap().to_vec::<i32>(), vec![2, -2, 0]);
+    }
+
+    #[test]
+    fn astype_bool_round_trip() {
+        let s = Stream::cpu();
+        // numeric -> bool is `!= 0`; bool -> numeric is 0/1.
+        let a = Array::from_slice(&[0.0f32, 1.0, 2.0, -3.0], &[4]);
+        let flags = a.astype::<bool>(&s).unwrap();
+        assert_eq!(flags.to_vec::<bool>(), vec![false, true, true, true]);
+        assert_eq!(
+            flags.astype::<i32>(&s).unwrap().to_vec::<i32>(),
+            vec![0, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn astype_to_same_dtype_is_a_noop() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.5f32, 2.5], &[2]);
+        assert_eq!(a.astype::<f32>(&s).unwrap().to_vec::<f32>(), vec![1.5, 2.5]);
     }
 
     #[test]
