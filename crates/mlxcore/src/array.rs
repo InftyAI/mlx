@@ -277,6 +277,28 @@ impl Array {
         unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
     }
 
+    /// Converts the elements to the dtype chosen by `T`.
+    ///
+    /// Call as `a.astype::<f32>(&stream)`. This is the only way to change an
+    /// array's dtype — it is otherwise fixed by whichever constructor built the
+    /// array. Note that binary ops already promote mixed dtypes on their own
+    /// (`int32 + float32` yields `float32`), so this is for *explicit* control.
+    ///
+    /// Conversions follow C++ cast semantics rather than Rust's, and never
+    /// error: float-to-integer truncates toward zero (`2.7` becomes `2`),
+    /// `bool` becomes 0 or 1, and numeric-to-`bool` tests `!= 0`. Converting a
+    /// float that is out of the target integer's range is *unspecified*.
+    ///
+    /// Only dtypes with an [`ArrayElement`] impl can be targeted, so MLX's
+    /// `float16`, `bfloat16`, and `complex64` are out of reach for now.
+    pub fn astype<T: ArrayElement>(&self, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; the result is written into `out`.
+        let status = unsafe { sys::mlx_astype(&mut out, self.handle, T::DTYPE, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
     /// Returns a row-contiguous copy (or the same array if already dense).
     pub fn contiguous(&self, stream: &Stream) -> Result<Array> {
         error::install();
@@ -365,6 +387,28 @@ impl Array {
     /// Elementwise minimum of two arrays.
     pub fn minimum(&self, other: &Array, stream: &Stream) -> Result<Array> {
         self.binary_op(other, stream, sys::mlx_minimum)
+    }
+
+    /// Matrix multiplication: `self @ other`.
+    ///
+    /// Unlike the elementwise ops, this contracts the last axis of `self`
+    /// against the second-to-last of `other`: `(n, k) @ (k, m)` gives
+    /// `(n, m)`. Mismatched inner dimensions return an error rather than
+    /// panicking.
+    ///
+    /// Following NumPy, a 1-dimensional operand is treated as a matrix for the
+    /// duration of the product and then collapsed again: a leading axis is
+    /// prepended to a 1-D `self`, a trailing axis appended to a 1-D `other`,
+    /// and the corresponding axis is removed from the result. So `(3,) @ (3,)`
+    /// is a 0-dimensional dot product, and `(2, 3) @ (3,)` is `(2,)`.
+    ///
+    /// Leading axes beyond the last two are batch dimensions and broadcast:
+    /// `(2, 3, 4) @ (2, 4, 5)` gives `(2, 3, 5)`.
+    ///
+    /// There is deliberately no operator for this. `*` is already elementwise
+    /// [`multiply`](Self::multiply), and Rust has no `@`.
+    pub fn matmul(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_matmul)
     }
 
     /// Sum of all elements, returning a scalar array.
@@ -762,6 +806,135 @@ mod tests {
         assert_eq!(
             a.multiply(&two, &s).unwrap().to_vec::<f32>(),
             vec![0.0, 2.0, 4.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn astype_converts_dtype() {
+        let s = Stream::cpu();
+        let ints = Array::from_slice(&[1i32, 2, 3], &[3]);
+
+        // Reading as f32 is only possible after converting.
+        let floats = ints.astype::<f32>(&s).unwrap();
+        assert_eq!(floats.to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+        // The original is untouched: astype returns a new array.
+        assert_eq!(ints.to_vec::<i32>(), vec![1, 2, 3]);
+        // Shape is preserved; only the dtype changes.
+        assert_eq!(floats.shape(), ints.shape());
+    }
+
+    #[test]
+    fn astype_narrowing_truncates_toward_zero() {
+        let s = Stream::cpu();
+        // C++ cast semantics: truncation, not rounding, and no error.
+        let a = Array::from_slice(&[2.7f32, -2.7, 0.9], &[3]);
+        assert_eq!(a.astype::<i32>(&s).unwrap().to_vec::<i32>(), vec![2, -2, 0]);
+    }
+
+    #[test]
+    fn astype_bool_round_trip() {
+        let s = Stream::cpu();
+        // numeric -> bool is `!= 0`; bool -> numeric is 0/1.
+        let a = Array::from_slice(&[0.0f32, 1.0, 2.0, -3.0], &[4]);
+        let flags = a.astype::<bool>(&s).unwrap();
+        assert_eq!(flags.to_vec::<bool>(), vec![false, true, true, true]);
+        assert_eq!(
+            flags.astype::<i32>(&s).unwrap().to_vec::<i32>(),
+            vec![0, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn astype_to_same_dtype_is_a_noop() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.5f32, 2.5], &[2]);
+        assert_eq!(a.astype::<f32>(&s).unwrap().to_vec::<f32>(), vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn matmul_contracts_inner_dimension() {
+        let s = Stream::cpu();
+        // (2,3) @ (3,2) -> (2,2)
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let b = Array::from_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], &[3, 2]);
+        let c = a.matmul(&b, &s).unwrap();
+        assert_eq!(c.shape(), vec![2, 2]);
+        // [1,2,3]·[7,9,11] = 58, [1,2,3]·[8,10,12] = 64,
+        // [4,5,6]·[7,9,11] = 139, [4,5,6]·[8,10,12] = 154.
+        assert_eq!(c.to_vec::<f32>(), vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn matmul_is_not_elementwise_multiply() {
+        let s = Stream::cpu();
+        // Same square operands: matmul and `*` must disagree.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        assert_eq!(
+            a.matmul(&a, &s).unwrap().to_vec::<f32>(),
+            vec![7.0, 10.0, 15.0, 22.0]
+        );
+        assert_eq!(
+            a.multiply(&a, &s).unwrap().to_vec::<f32>(),
+            vec![1.0, 4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
+    fn matmul_collapses_one_dim_operands() {
+        let s = Stream::cpu();
+        let v = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+
+        // (3,) @ (3,) is a dot product, and the result is 0-dimensional.
+        let dot = v.matmul(&v, &s).unwrap();
+        assert_eq!(dot.ndim(), 0);
+        assert_eq!(dot.item::<f32>(), 14.0); // 1 + 4 + 9
+
+        // (2,3) @ (3,) -> (2,), the appended axis is dropped again.
+        let m = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let mv = m.matmul(&v, &s).unwrap();
+        assert_eq!(mv.shape(), vec![2]);
+        assert_eq!(mv.to_vec::<f32>(), vec![14.0, 32.0]);
+    }
+
+    #[test]
+    fn matmul_broadcasts_batch_dimensions() {
+        let s = Stream::cpu();
+        // Leading axes are batch dims: (2,2,3) @ (2,3,2) -> (2,2,2).
+        let a = Array::arange::<f32>(0.0, 12.0, 1.0, &s)
+            .unwrap()
+            .reshape(&[2, 2, 3], &s)
+            .unwrap();
+        let b = Array::ones::<f32>(&[2, 3, 2], &s).unwrap();
+        let c = a.matmul(&b, &s).unwrap();
+        assert_eq!(c.shape(), vec![2, 2, 2]);
+        // With a ones matrix each output is the row sum, duplicated per column.
+        assert_eq!(
+            c.to_vec::<f32>(),
+            vec![3.0, 3.0, 12.0, 12.0, 21.0, 21.0, 30.0, 30.0]
+        );
+    }
+
+    #[test]
+    fn matmul_with_transpose() {
+        let s = Stream::cpu();
+        // The shape a linear layer uses: x @ w.T, (2,3) @ (2,3).T -> (2,2).
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let w = Array::from_slice(&[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3]);
+        let out = x.matmul(&w.transpose(&s).unwrap(), &s).unwrap();
+        assert_eq!(out.shape(), vec![2, 2]);
+        // Rows of w select element 0 and element 1 of each row of x.
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 2.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn matmul_shape_mismatch_returns_err() {
+        let s = Stream::cpu();
+        // (2,3) @ (2,3) has inner dims 3 and 2 — not an error we should panic on.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let err = a.matmul(&a, &s).unwrap_err();
+        assert!(
+            !err.message().is_empty(),
+            "expected a message from mlx, got {err:?}"
         );
     }
 
