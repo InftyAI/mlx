@@ -6,7 +6,10 @@
 mod array;
 mod dtype;
 mod error;
+mod ffi;
 mod stream;
+
+pub mod random;
 
 pub use array::Array;
 pub use dtype::ArrayElement;

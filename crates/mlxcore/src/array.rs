@@ -7,6 +7,7 @@ use mlxcore_sys as sys;
 
 use crate::dtype::ArrayElement;
 use crate::error::{self, Result};
+use crate::ffi::as_ffi_ptr;
 use crate::stream::Stream;
 
 /// An N-dimensional MLX array.
@@ -14,20 +15,6 @@ use crate::stream::Stream;
 /// Owns the underlying `mlx_array` handle and frees it on drop.
 pub struct Array {
     handle: sys::mlx_array,
-}
-
-/// Returns a pointer to `slice`'s data, or null when it is empty.
-///
-/// For an empty slice `as_ptr()` is non-null but dangling. The mlx-c functions
-/// we call take a `(ptr, len)` pair and build a container from it, so they never
-/// dereference the pointer when `len == 0` — but passing an explicit null keeps
-/// a dangling pointer from crossing the FFI boundary at all.
-fn as_ffi_ptr<T>(slice: &[T]) -> *const T {
-    if slice.is_empty() {
-        std::ptr::null()
-    } else {
-        slice.as_ptr()
-    }
 }
 
 impl Array {
@@ -634,7 +621,7 @@ impl Array {
     ///
     /// On failure, frees the (unused) `out` handle and returns the captured
     /// MLX error message.
-    fn from_op(out: sys::mlx_array, status: i32) -> Result<Array> {
+    pub(crate) fn from_op(out: sys::mlx_array, status: i32) -> Result<Array> {
         match error::check(status) {
             Ok(()) => Ok(unsafe { Self::from_raw(out) }),
             Err(e) => {
