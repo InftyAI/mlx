@@ -22,7 +22,7 @@ mod stream;
 pub mod random;
 
 pub use array::Array;
-pub use dtype::ArrayElement;
+pub use dtype::{ArrayElement, Dtype};
 pub use error::{Error, Result};
 pub use stream::Stream;
 
