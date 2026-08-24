@@ -389,6 +389,28 @@ impl Array {
         self.binary_op(other, stream, sys::mlx_minimum)
     }
 
+    /// Matrix multiplication: `self @ other`.
+    ///
+    /// Unlike the elementwise ops, this contracts the last axis of `self`
+    /// against the second-to-last of `other`: `(n, k) @ (k, m)` gives
+    /// `(n, m)`. Mismatched inner dimensions return an error rather than
+    /// panicking.
+    ///
+    /// Following NumPy, a 1-dimensional operand is treated as a matrix for the
+    /// duration of the product and then collapsed again: a leading axis is
+    /// prepended to a 1-D `self`, a trailing axis appended to a 1-D `other`,
+    /// and the corresponding axis is removed from the result. So `(3,) @ (3,)`
+    /// is a 0-dimensional dot product, and `(2, 3) @ (3,)` is `(2,)`.
+    ///
+    /// Leading axes beyond the last two are batch dimensions and broadcast:
+    /// `(2, 3, 4) @ (2, 4, 5)` gives `(2, 3, 5)`.
+    ///
+    /// There is deliberately no operator for this. `*` is already elementwise
+    /// [`multiply`](Self::multiply), and Rust has no `@`.
+    pub fn matmul(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_matmul)
+    }
+
     /// Sum of all elements, returning a scalar array.
     ///
     /// With `keepdims == false` the result is 0-dimensional.
@@ -827,6 +849,93 @@ mod tests {
         let s = Stream::cpu();
         let a = Array::from_slice(&[1.5f32, 2.5], &[2]);
         assert_eq!(a.astype::<f32>(&s).unwrap().to_vec::<f32>(), vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn matmul_contracts_inner_dimension() {
+        let s = Stream::cpu();
+        // (2,3) @ (3,2) -> (2,2)
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let b = Array::from_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], &[3, 2]);
+        let c = a.matmul(&b, &s).unwrap();
+        assert_eq!(c.shape(), vec![2, 2]);
+        // [1,2,3]·[7,9,11] = 58, [1,2,3]·[8,10,12] = 64,
+        // [4,5,6]·[7,9,11] = 139, [4,5,6]·[8,10,12] = 154.
+        assert_eq!(c.to_vec::<f32>(), vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn matmul_is_not_elementwise_multiply() {
+        let s = Stream::cpu();
+        // Same square operands: matmul and `*` must disagree.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        assert_eq!(
+            a.matmul(&a, &s).unwrap().to_vec::<f32>(),
+            vec![7.0, 10.0, 15.0, 22.0]
+        );
+        assert_eq!(
+            a.multiply(&a, &s).unwrap().to_vec::<f32>(),
+            vec![1.0, 4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
+    fn matmul_collapses_one_dim_operands() {
+        let s = Stream::cpu();
+        let v = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+
+        // (3,) @ (3,) is a dot product, and the result is 0-dimensional.
+        let dot = v.matmul(&v, &s).unwrap();
+        assert_eq!(dot.ndim(), 0);
+        assert_eq!(dot.item::<f32>(), 14.0); // 1 + 4 + 9
+
+        // (2,3) @ (3,) -> (2,), the appended axis is dropped again.
+        let m = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let mv = m.matmul(&v, &s).unwrap();
+        assert_eq!(mv.shape(), vec![2]);
+        assert_eq!(mv.to_vec::<f32>(), vec![14.0, 32.0]);
+    }
+
+    #[test]
+    fn matmul_broadcasts_batch_dimensions() {
+        let s = Stream::cpu();
+        // Leading axes are batch dims: (2,2,3) @ (2,3,2) -> (2,2,2).
+        let a = Array::arange::<f32>(0.0, 12.0, 1.0, &s)
+            .unwrap()
+            .reshape(&[2, 2, 3], &s)
+            .unwrap();
+        let b = Array::ones::<f32>(&[2, 3, 2], &s).unwrap();
+        let c = a.matmul(&b, &s).unwrap();
+        assert_eq!(c.shape(), vec![2, 2, 2]);
+        // With a ones matrix each output is the row sum, duplicated per column.
+        assert_eq!(
+            c.to_vec::<f32>(),
+            vec![3.0, 3.0, 12.0, 12.0, 21.0, 21.0, 30.0, 30.0]
+        );
+    }
+
+    #[test]
+    fn matmul_with_transpose() {
+        let s = Stream::cpu();
+        // The shape a linear layer uses: x @ w.T, (2,3) @ (2,3).T -> (2,2).
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let w = Array::from_slice(&[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3]);
+        let out = x.matmul(&w.transpose(&s).unwrap(), &s).unwrap();
+        assert_eq!(out.shape(), vec![2, 2]);
+        // Rows of w select element 0 and element 1 of each row of x.
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 2.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn matmul_shape_mismatch_returns_err() {
+        let s = Stream::cpu();
+        // (2,3) @ (2,3) has inner dims 3 and 2 — not an error we should panic on.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let err = a.matmul(&a, &s).unwrap_err();
+        assert!(
+            !err.message().is_empty(),
+            "expected a message from mlx, got {err:?}"
+        );
     }
 
     #[test]
