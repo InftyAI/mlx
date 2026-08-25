@@ -109,7 +109,7 @@ pub fn normal<T: ArrayElement>(
             &mut out,
             as_ffi_ptr(shape),
             shape.len(),
-            T::DTYPE,
+            T::DTYPE.as_raw(),
             loc,
             scale,
             Key::handle(key),
@@ -144,7 +144,7 @@ pub fn uniform<T: ArrayElement>(
             high.as_raw(),
             as_ffi_ptr(shape),
             shape.len(),
-            T::DTYPE,
+            T::DTYPE.as_raw(),
             Key::handle(key),
             stream.as_raw(),
         )

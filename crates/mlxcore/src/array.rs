@@ -5,7 +5,7 @@ use std::fmt;
 
 use mlxcore_sys as sys;
 
-use crate::dtype::ArrayElement;
+use crate::dtype::{ArrayElement, Dtype};
 use crate::error::{self, Result};
 use crate::ffi::as_ffi_ptr;
 use crate::stream::Stream;
@@ -56,8 +56,9 @@ impl Array {
         let shape_ptr = as_ffi_ptr(shape);
         // SAFETY: pointers/len describe valid slices (or null/0) for the
         // duration of the call; mlx copies the data into its own buffer.
-        let handle =
-            unsafe { sys::mlx_array_new_data(data_ptr, shape_ptr, shape.len() as i32, T::DTYPE) };
+        let handle = unsafe {
+            sys::mlx_array_new_data(data_ptr, shape_ptr, shape.len() as i32, T::DTYPE.as_raw())
+        };
         unsafe { Self::from_raw(handle) }
     }
 
@@ -98,7 +99,7 @@ impl Array {
                 shape_ptr,
                 shape.len(),
                 vals.as_raw(),
-                T::DTYPE,
+                T::DTYPE.as_raw(),
                 stream.as_raw(),
             )
         };
@@ -118,8 +119,16 @@ impl Array {
         error::install();
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: stream is valid; the result is written into `out`.
-        let status =
-            unsafe { sys::mlx_arange(&mut out, start, stop, step, T::DTYPE, stream.as_raw()) };
+        let status = unsafe {
+            sys::mlx_arange(
+                &mut out,
+                start,
+                stop,
+                step,
+                T::DTYPE.as_raw(),
+                stream.as_raw(),
+            )
+        };
         Self::from_op(out, status)
     }
 
@@ -140,6 +149,16 @@ impl Array {
         // SAFETY: mlx guarantees the returned pointer is valid for `ndim` ints.
         let ptr = unsafe { sys::mlx_array_shape(self.handle) };
         (0..ndim).map(|i| unsafe { *ptr.add(i) }).collect()
+    }
+
+    /// Element type of the array.
+    ///
+    /// MLX decides this itself: constructors take it from the Rust type, but ops
+    /// promote (an `i32` array times a `f32` one is `f32`) and comparisons always
+    /// give [`Dtype::Bool`], so this is the way to check what an op produced.
+    pub fn dtype(&self) -> Dtype {
+        // SAFETY: mlx_array_dtype reads a valid handle.
+        Dtype::from_raw(unsafe { sys::mlx_array_dtype(self.handle) })
     }
 
     /// Strides of the array, in elements (not bytes), one per dimension.
@@ -246,12 +265,11 @@ impl Array {
     /// Panics if `T::DTYPE` does not match the array's dtype. Assumes the array
     /// is already evaluated and row-contiguous.
     fn read_buffer<T: ArrayElement>(&self) -> Vec<T> {
-        // SAFETY: mlx_array_dtype reads a valid handle.
-        let dtype = unsafe { sys::mlx_array_dtype(self.handle) };
+        let dtype = self.dtype();
         assert_eq!(
             dtype,
             T::DTYPE,
-            "array dtype does not match requested element type"
+            "array dtype {dtype} does not match requested element type"
         );
         let len = self.size();
         // `from_raw_parts` requires a non-null, aligned pointer even for a
@@ -285,7 +303,8 @@ impl Array {
         error::install();
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: handle/stream are valid; the result is written into `out`.
-        let status = unsafe { sys::mlx_astype(&mut out, self.handle, T::DTYPE, stream.as_raw()) };
+        let status =
+            unsafe { sys::mlx_astype(&mut out, self.handle, T::DTYPE.as_raw(), stream.as_raw()) };
         Self::from_op(out, status)
     }
 
@@ -379,6 +398,86 @@ impl Array {
         self.binary_op(other, stream, sys::mlx_minimum)
     }
 
+    /// Elementwise `self == other`, as a `bool` array.
+    ///
+    /// Like the arithmetic ops these broadcast, so comparing against a
+    /// [`from_scalar`](Self::from_scalar) array gives a mask over every element.
+    /// Read the result back with `to_vec::<bool>()`.
+    ///
+    /// These are named after the MLX operations rather than spelled `eq`/`lt`,
+    /// because they are elementwise and return an array — they are not the
+    /// whole-array `bool` answer that `PartialEq`/`PartialOrd` would imply. For
+    /// that, see [`array_equal`](Self::array_equal).
+    pub fn equal(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_equal)
+    }
+
+    /// Elementwise `self != other`, as a `bool` array.
+    pub fn not_equal(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_not_equal)
+    }
+
+    /// Elementwise `self > other`, as a `bool` array.
+    pub fn greater(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_greater)
+    }
+
+    /// Elementwise `self >= other`, as a `bool` array.
+    pub fn greater_equal(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_greater_equal)
+    }
+
+    /// Elementwise `self < other`, as a `bool` array.
+    pub fn less(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_less)
+    }
+
+    /// Elementwise `self <= other`, as a `bool` array.
+    pub fn less_equal(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_less_equal)
+    }
+
+    /// Elementwise logical and, as a `bool` array.
+    ///
+    /// Non-`bool` operands are compared against zero first, so this is a
+    /// truthiness test rather than a bitwise one.
+    pub fn logical_and(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_logical_and)
+    }
+
+    /// Elementwise logical or, as a `bool` array.
+    pub fn logical_or(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_logical_or)
+    }
+
+    /// Elementwise logical negation, as a `bool` array.
+    pub fn logical_not(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_logical_not)
+    }
+
+    /// Whether the two arrays have the same shape and equal elements, as a
+    /// 0-dimensional `bool` array.
+    ///
+    /// This is the whole-array answer, in contrast to the elementwise
+    /// [`equal`](Self::equal). Arrays of different shapes are unequal — unlike
+    /// `equal`, nothing is broadcast. With `equal_nan == true` two NaNs in the
+    /// same position count as equal.
+    pub fn array_equal(&self, other: &Array, equal_nan: bool, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: all handles are valid; the result is written into `out`.
+        let status = unsafe {
+            sys::mlx_array_equal(
+                &mut out,
+                self.handle,
+                other.as_raw(),
+                equal_nan,
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
     /// Matrix multiplication: `self @ other`.
     ///
     /// Unlike the elementwise ops, this contracts the last axis of `self`
@@ -413,6 +512,43 @@ impl Array {
     /// With `keepdims == false` the result is 0-dimensional.
     pub fn mean(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
         self.reduce_op(keepdims, stream, sys::mlx_mean)
+    }
+
+    /// Maximum of all elements, returning a scalar array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional.
+    pub fn max(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_op(keepdims, stream, sys::mlx_max)
+    }
+
+    /// Minimum of all elements, returning a scalar array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional.
+    pub fn min(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_op(keepdims, stream, sys::mlx_min)
+    }
+
+    /// Product of all elements, returning a scalar array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional.
+    pub fn prod(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_op(keepdims, stream, sys::mlx_prod)
+    }
+
+    /// Whether every element is true (nonzero), as a `bool` array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional. Empty arrays reduce
+    /// to `true`, the identity of logical and.
+    pub fn all(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_op(keepdims, stream, sys::mlx_all)
+    }
+
+    /// Whether any element is true (nonzero), as a `bool` array.
+    ///
+    /// With `keepdims == false` the result is 0-dimensional. Empty arrays reduce
+    /// to `false`, the identity of logical or.
+    pub fn any(&self, keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_op(keepdims, stream, sys::mlx_any)
     }
 
     /// Sum over the given axes.
@@ -455,6 +591,22 @@ impl Array {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_prod_axes)
     }
 
+    /// Whether every element is true (nonzero) over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn all_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_all_axes)
+    }
+
+    /// Whether any element is true (nonzero) over the given axes.
+    ///
+    /// With `keepdims == false` the reduced axes are removed; otherwise they
+    /// are kept with size 1.
+    pub fn any_axes(&self, axes: &[i32], keepdims: bool, stream: &Stream) -> Result<Array> {
+        self.reduce_axes_op(axes, keepdims, stream, sys::mlx_any_axes)
+    }
+
     /// Returns a new array with the same data reinterpreted as `shape`.
     ///
     /// The product of `shape` must equal [`size`](Self::size).
@@ -490,7 +642,7 @@ impl Array {
     /// constructors.
     fn fill_op(
         shape: &[i32],
-        dtype: sys::mlx_dtype,
+        dtype: Dtype,
         stream: &Stream,
         op: unsafe extern "C" fn(
             *mut sys::mlx_array,
@@ -505,7 +657,15 @@ impl Array {
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: `shape_ptr`/`shape.len()` describe a valid slice (or null/0);
         // stream is valid; `op` writes the result into `out`.
-        let status = unsafe { op(&mut out, shape_ptr, shape.len(), dtype, stream.as_raw()) };
+        let status = unsafe {
+            op(
+                &mut out,
+                shape_ptr,
+                shape.len(),
+                dtype.as_raw(),
+                stream.as_raw(),
+            )
+        };
         Self::from_op(out, status)
     }
 
@@ -1093,6 +1253,226 @@ mod tests {
             scaled.to_vec::<f32>(),
             vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
         );
+    }
+
+    #[test]
+    fn full_reductions_over_all_elements() {
+        let s = Stream::cpu();
+        // Reduces across every axis, not just the last one.
+        let a = Array::from_slice(&[3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0], &[2, 3]);
+        assert_eq!(a.max(false, &s).unwrap().item::<f32>(), 9.0);
+        assert_eq!(a.min(false, &s).unwrap().item::<f32>(), 1.0);
+
+        let b = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        assert_eq!(b.prod(false, &s).unwrap().item::<f32>(), 24.0);
+    }
+
+    #[test]
+    fn full_reductions_respect_keepdims() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+
+        // Without keepdims the rank collapses to 0...
+        assert_eq!(a.max(false, &s).unwrap().ndim(), 0);
+        // ...with it, every reduced axis is kept at size 1.
+        assert_eq!(a.max(true, &s).unwrap().shape(), vec![1, 1]);
+        assert_eq!(a.min(true, &s).unwrap().shape(), vec![1, 1]);
+        assert_eq!(a.prod(true, &s).unwrap().shape(), vec![1, 1]);
+    }
+
+    #[test]
+    fn full_reductions_agree_with_axis_versions() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0], &[2, 3]);
+        // Reducing over all axes explicitly must match the full reduction.
+        assert_eq!(
+            a.max(false, &s).unwrap().item::<f32>(),
+            a.max_axes(&[0, 1], false, &s).unwrap().item::<f32>()
+        );
+        assert_eq!(
+            a.min(false, &s).unwrap().item::<f32>(),
+            a.min_axes(&[0, 1], false, &s).unwrap().item::<f32>()
+        );
+        assert_eq!(
+            a.prod(false, &s).unwrap().item::<f32>(),
+            a.prod_axes(&[0, 1], false, &s).unwrap().item::<f32>()
+        );
+    }
+
+    #[test]
+    fn dtype_reports_the_element_type() {
+        let s = Stream::cpu();
+        assert_eq!(
+            Array::from_slice(&[1.0f32, 2.0], &[2]).dtype(),
+            Dtype::Float32
+        );
+        assert_eq!(Array::from_slice(&[1i32, 2], &[2]).dtype(), Dtype::Int32);
+        assert_eq!(Array::from_scalar(true).dtype(), Dtype::Bool);
+        assert_eq!(Array::zeros::<u8>(&[2], &s).unwrap().dtype(), Dtype::Uint8);
+
+        // Ops decide the dtype themselves: astype converts, and mixing widens.
+        let ints = Array::from_slice(&[1i32, 2], &[2]);
+        assert_eq!(ints.astype::<f32>(&s).unwrap().dtype(), Dtype::Float32);
+        let floats = Array::from_slice(&[0.5f32, 0.5], &[2]);
+        assert_eq!(ints.add(&floats, &s).unwrap().dtype(), Dtype::Float32);
+    }
+
+    #[test]
+    #[should_panic(expected = "array dtype float32 does not match")]
+    fn reading_the_wrong_element_type_panics() {
+        let _ = Array::from_slice(&[1.0f32, 2.0], &[2]).to_vec::<i32>();
+    }
+
+    #[test]
+    fn comparisons_produce_bool_masks() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let b = Array::from_slice(&[3.0f32, 2.0, 1.0], &[3]);
+
+        let eq = a.equal(&b, &s).unwrap();
+        // Comparing floats gives bool, not float.
+        assert_eq!(eq.dtype(), Dtype::Bool);
+        assert_eq!(eq.to_vec::<bool>(), vec![false, true, false]);
+
+        assert_eq!(
+            a.not_equal(&b, &s).unwrap().to_vec::<bool>(),
+            vec![true, false, true]
+        );
+        assert_eq!(
+            a.greater(&b, &s).unwrap().to_vec::<bool>(),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            a.greater_equal(&b, &s).unwrap().to_vec::<bool>(),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            a.less(&b, &s).unwrap().to_vec::<bool>(),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            a.less_equal(&b, &s).unwrap().to_vec::<bool>(),
+            vec![true, true, false]
+        );
+    }
+
+    #[test]
+    fn comparisons_broadcast_against_a_scalar() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let mask = a.greater(&Array::from_scalar(2.0f32), &s).unwrap();
+        // The scalar stretches over both axes, so the mask keeps `a`'s shape.
+        assert_eq!(mask.shape(), vec![2, 2]);
+        assert_eq!(mask.to_vec::<bool>(), vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn logical_ops_combine_masks() {
+        let s = Stream::cpu();
+        let x = Array::from_slice(&[true, true, false, false], &[4]);
+        let y = Array::from_slice(&[true, false, true, false], &[4]);
+
+        assert_eq!(
+            x.logical_and(&y, &s).unwrap().to_vec::<bool>(),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            x.logical_or(&y, &s).unwrap().to_vec::<bool>(),
+            vec![true, true, true, false]
+        );
+        assert_eq!(
+            x.logical_not(&s).unwrap().to_vec::<bool>(),
+            vec![false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn logical_ops_test_truthiness_of_numbers() {
+        let s = Stream::cpu();
+        // 2.0 is neither 1 nor 0: a bitwise `and` would give 0, truthiness gives true.
+        let a = Array::from_slice(&[2.0f32, 0.0], &[2]);
+        let b = Array::from_slice(&[4.0f32, 7.0], &[2]);
+        assert_eq!(
+            a.logical_and(&b, &s).unwrap().to_vec::<bool>(),
+            vec![true, false]
+        );
+        assert_eq!(
+            a.logical_not(&s).unwrap().to_vec::<bool>(),
+            vec![false, true]
+        );
+    }
+
+    #[test]
+    fn all_and_any_reduce_masks_to_one_answer() {
+        let s = Stream::cpu();
+        let mixed = Array::from_slice(&[true, false], &[2]);
+        assert!(!mixed.all(false, &s).unwrap().item::<bool>());
+        assert!(mixed.any(false, &s).unwrap().item::<bool>());
+
+        let all_true = Array::from_slice(&[true, true], &[2]);
+        assert!(all_true.all(false, &s).unwrap().item::<bool>());
+
+        let none = Array::from_slice(&[false, false], &[2]);
+        assert!(!none.any(false, &s).unwrap().item::<bool>());
+
+        // The reduction is over every axis, and `keepdims` behaves as elsewhere.
+        let grid = Array::from_slice(&[true, false, true, true], &[2, 2]);
+        assert!(!grid.all(false, &s).unwrap().item::<bool>());
+        assert_eq!(grid.any(true, &s).unwrap().shape(), vec![1, 1]);
+    }
+
+    #[test]
+    fn all_and_any_over_axes_reduce_per_row() {
+        let s = Stream::cpu();
+        let grid = Array::from_slice(&[true, false, true, true], &[2, 2]);
+        // Row 0 is mixed, row 1 is all true.
+        assert_eq!(
+            grid.all_axes(&[1], false, &s).unwrap().to_vec::<bool>(),
+            vec![false, true]
+        );
+        assert_eq!(
+            grid.any_axes(&[1], false, &s).unwrap().to_vec::<bool>(),
+            vec![true, true]
+        );
+        // Column 0 is all true, column 1 is mixed.
+        assert_eq!(
+            grid.all_axes(&[0], false, &s).unwrap().to_vec::<bool>(),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn empty_reductions_return_the_identity() {
+        let s = Stream::cpu();
+        let empty = Array::from_slice::<bool>(&[], &[0]);
+        assert!(empty.all(false, &s).unwrap().item::<bool>());
+        assert!(!empty.any(false, &s).unwrap().item::<bool>());
+    }
+
+    #[test]
+    fn array_equal_compares_whole_arrays() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let same = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let different = Array::from_slice(&[1.0f32, 9.0, 3.0], &[3]);
+
+        assert!(a.array_equal(&same, false, &s).unwrap().item::<bool>());
+        assert!(!a.array_equal(&different, false, &s).unwrap().item::<bool>());
+        // Unlike `equal`, nothing is broadcast: a different shape is unequal
+        // even when the elements line up.
+        let row = Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 3]);
+        assert!(!a.array_equal(&row, false, &s).unwrap().item::<bool>());
+        assert_eq!(a.equal(&row, &s).unwrap().shape(), vec![1, 3]);
+    }
+
+    #[test]
+    fn array_equal_can_treat_nans_as_equal() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, f32::NAN], &[2]);
+        let b = Array::from_slice(&[1.0f32, f32::NAN], &[2]);
+        // NaN != NaN, so the default comparison fails.
+        assert!(!a.array_equal(&b, false, &s).unwrap().item::<bool>());
+        assert!(a.array_equal(&b, true, &s).unwrap().item::<bool>());
     }
 
     #[test]
