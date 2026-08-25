@@ -946,6 +946,46 @@ macro_rules! impl_scalar_lhs_binop {
 // Every type with an `ArrayElement` impl, so the two directions stay symmetric.
 impl_scalar_lhs_binop!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
+// `a += &b`, for both array and scalar right-hand sides.
+//
+// These do **not** mutate in place. MLX has no in-place ops: the op builds a new
+// array and `a` is rebound to it, dropping the old handle. So `a += &b` is
+// exactly `a = &a + &b` with less typing, and it saves no memory. Two visible
+// consequences: `a` must be owned and `mut` (not a `&Array`), and the dtype can
+// change under it, since MLX promotes — `a += 1.0f64` leaves `a` float64.
+//
+// Same default-stream and panic-on-failure contract as the operators above.
+macro_rules! impl_op_assign {
+    ($($trait:ident :: $method:ident => $op:ident),* $(,)?) => {
+        $(
+            impl std::ops::$trait<&Array> for Array {
+                fn $method(&mut self, rhs: &Array) {
+                    *self = self.$op(rhs, &Stream::default()).unwrap_or_else(|e| {
+                        panic!(concat!("Array::", stringify!($op), " failed: {}"), e)
+                    });
+                }
+            }
+
+            impl<T: ArrayElement> std::ops::$trait<T> for Array {
+                fn $method(&mut self, rhs: T) {
+                    *self = self
+                        .$op(&Array::from_scalar(rhs), &Stream::default())
+                        .unwrap_or_else(|e| {
+                            panic!(concat!("Array::", stringify!($op), " failed: {}"), e)
+                        });
+                }
+            }
+        )*
+    };
+}
+
+impl_op_assign! {
+    AddAssign::add_assign => add,
+    SubAssign::sub_assign => subtract,
+    MulAssign::mul_assign => multiply,
+    DivAssign::div_assign => divide,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,12 +1355,6 @@ mod tests {
         assert_eq!(ints.astype::<f32>(&s).unwrap().dtype(), Dtype::Float32);
         let floats = Array::from_slice(&[0.5f32, 0.5], &[2]);
         assert_eq!(ints.add(&floats, &s).unwrap().dtype(), Dtype::Float32);
-    }
-
-    #[test]
-    #[should_panic(expected = "array dtype float32 does not match")]
-    fn reading_the_wrong_element_type_panics() {
-        let _ = Array::from_slice(&[1.0f32, 2.0], &[2]).to_vec::<i32>();
     }
 
     #[test]
@@ -1728,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "does not match requested element type")]
+    #[should_panic(expected = "array dtype int32 does not match requested element type")]
     fn to_vec_wrong_dtype_panics() {
         let ints = Array::from_slice(&[1i32, 2, 3], &[3]);
         let _ = ints.to_vec::<f32>();
@@ -1757,6 +1791,61 @@ mod tests {
 
         // Operands are borrowed, so `a` is still usable here.
         assert_eq!(a.to_vec::<f32>(), vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn assigning_operators_match_methods() {
+        let b = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+
+        let mut a = Array::from_slice(&[10.0f32, 20.0, 30.0], &[3]);
+        a += &b;
+        assert_eq!(a.to_vec::<f32>(), vec![11.0, 22.0, 33.0]);
+        a -= &b;
+        assert_eq!(a.to_vec::<f32>(), vec![10.0, 20.0, 30.0]);
+        a *= &b;
+        assert_eq!(a.to_vec::<f32>(), vec![10.0, 40.0, 90.0]);
+        a /= &b;
+        assert_eq!(a.to_vec::<f32>(), vec![10.0, 20.0, 30.0]);
+
+        // The right-hand side is borrowed, so `b` survives all four.
+        assert_eq!(b.to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn assigning_operators_take_scalars() {
+        let mut a = Array::from_slice(&[10.0f32, 20.0], &[2]);
+        a += 5.0f32;
+        assert_eq!(a.to_vec::<f32>(), vec![15.0, 25.0]);
+        a *= 2.0f32;
+        assert_eq!(a.to_vec::<f32>(), vec![30.0, 50.0]);
+        a -= 10.0f32;
+        assert_eq!(a.to_vec::<f32>(), vec![20.0, 40.0]);
+        a /= 4.0f32;
+        assert_eq!(a.to_vec::<f32>(), vec![5.0, 10.0]);
+    }
+
+    #[test]
+    fn assigning_operators_rebind_rather_than_mutate() {
+        // Broadcasting means the result need not even have the same shape as the
+        // original, which an in-place op could not do.
+        let mut a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        a += &Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[2, 2]);
+        assert_eq!(a.shape(), vec![2, 2]);
+        assert_eq!(a.to_vec::<f32>(), vec![11.0, 22.0, 31.0, 42.0]);
+
+        // And MLX's promotion applies, so the dtype can change under `a`.
+        let mut ints = Array::from_slice(&[1i32, 2], &[2]);
+        assert_eq!(ints.dtype(), Dtype::Int32);
+        ints *= 0.5f32;
+        assert_eq!(ints.dtype(), Dtype::Float32);
+        assert_eq!(ints.to_vec::<f32>(), vec![0.5, 1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Array::subtract failed: MLX error:")]
+    fn assigning_operator_panic_carries_mlx_message() {
+        let mut a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        a -= &Array::from_slice(&[1.0f32, 2.0], &[2]);
     }
 
     #[test]
