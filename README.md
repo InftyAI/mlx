@@ -35,7 +35,8 @@ The first build compiles MLX from source and takes several minutes.
 Runnable examples live in `crates/mlxcore/examples`:
 
 ```sh
-cargo run --example hello
+cargo run --example hello   # arrays, shapes, streams
+cargo run --example linear  # y = relu(x @ W + b) with random weights
 ```
 
 ## Note: suffix float literals with `f32`

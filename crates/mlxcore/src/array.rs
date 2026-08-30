@@ -451,8 +451,50 @@ impl Array {
     }
 
     /// Elementwise logical negation, as a `bool` array.
+    ///
+    /// For the `!` operator, see [`bitwise_invert`](Self::bitwise_invert) — on a
+    /// `bool` array the two are the same operation.
     pub fn logical_not(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_logical_not)
+    }
+
+    /// Elementwise bitwise and — the `&` operator.
+    ///
+    /// Integer and `bool` arrays only; a float operand is an error, exactly as
+    /// Rust has no `&` for `f32`. On `bool` arrays this coincides with
+    /// [`logical_and`](Self::logical_and), which is why `&` works on the masks
+    /// that comparisons produce.
+    pub fn bitwise_and(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_bitwise_and)
+    }
+
+    /// Elementwise bitwise or — the `|` operator.
+    pub fn bitwise_or(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_bitwise_or)
+    }
+
+    /// Elementwise bitwise exclusive or — the `^` operator.
+    pub fn bitwise_xor(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_bitwise_xor)
+    }
+
+    /// Elementwise bitwise complement — the `!` operator.
+    ///
+    /// Follows Rust's `!`: on a `bool` array MLX defers to
+    /// [`logical_not`](Self::logical_not), on integers it flips every bit (so
+    /// `0i32` becomes `-1`), and a float operand is an error.
+    pub fn bitwise_invert(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_bitwise_invert)
+    }
+
+    /// Elementwise left shift — the `<<` operator.
+    pub fn left_shift(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_left_shift)
+    }
+
+    /// Elementwise right shift — the `>>` operator.
+    pub fn right_shift(&self, other: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(other, stream, sys::mlx_right_shift)
     }
 
     /// Whether the two arrays have the same shape and equal elements, as a
@@ -819,9 +861,14 @@ impl Drop for Array {
     }
 }
 
-// Arithmetic operators run on the current default stream (see
+// Arithmetic and bitwise operators run on the current default stream (see
 // [`Stream::set_as_default`]). For explicit stream control — and to handle
 // errors — call the inherent methods (`a.add(&b, &stream)?`) instead.
+//
+// `&`, `|`, `^`, and `!` are the *bitwise* ops, matching what Rust's operators
+// mean on primitives: logical on `bool` (so they work on comparison masks),
+// bit-twiddling on integers, and an error on floats. `logical_and` and friends
+// stay methods, since Rust cannot overload `&&`/`||` at all.
 //
 // Operators cannot return `Result`, so they **panic** if the underlying op
 // fails (e.g. incompatible shapes). Use the methods when failure is possible.
@@ -848,6 +895,11 @@ impl_binop! {
     Sub::sub => subtract,
     Mul::mul => multiply,
     Div::div => divide,
+    BitAnd::bitand => bitwise_and,
+    BitOr::bitor => bitwise_or,
+    BitXor::bitxor => bitwise_xor,
+    Shl::shl => left_shift,
+    Shr::shr => right_shift,
 }
 
 impl std::ops::Neg for &Array {
@@ -855,6 +907,14 @@ impl std::ops::Neg for &Array {
     fn neg(self) -> Array {
         self.negative(&Stream::default())
             .unwrap_or_else(|e| panic!("Array::negative failed: {e}"))
+    }
+}
+
+impl std::ops::Not for &Array {
+    type Output = Array;
+    fn not(self) -> Array {
+        self.bitwise_invert(&Stream::default())
+            .unwrap_or_else(|e| panic!("Array::bitwise_invert failed: {e}"))
     }
 }
 
@@ -886,6 +946,11 @@ impl_scalar_rhs_binop! {
     Sub::sub => subtract,
     Mul::mul => multiply,
     Div::div => divide,
+    BitAnd::bitand => bitwise_and,
+    BitOr::bitor => bitwise_or,
+    BitXor::bitxor => bitwise_xor,
+    Shl::shl => left_shift,
+    Shr::shr => right_shift,
 }
 
 /// Applies `op(scalar, rhs)` on the default stream, panicking on failure.
@@ -902,49 +967,55 @@ fn scalar_lhs_op<T: ArrayElement>(
     op(&lhs, rhs, &Stream::default()).unwrap_or_else(|e| panic!("Array::{name} failed: {e}"))
 }
 
-// The mirror of the impls above, for `2.0f32 * &a`. Worth having because `Sub`
-// and `Div` are not commutative: `10.0 - &a` cannot be spelled with the
-// scalar-on-the-right impls.
+// The mirror of the impls above, for `2.0f32 * &a`. Worth having because `Sub`,
+// `Div`, and the shifts are not commutative: `10.0 - &a` and `1 << &shifts`
+// cannot be spelled with the scalar-on-the-right impls.
 //
 // These cannot be one blanket `impl<T: ArrayElement> Add<&Array> for T` — that
 // implements a foreign trait for an uncovered type parameter, which coherence
 // forbids (E0210). So they are generated per concrete element type instead.
-macro_rules! impl_scalar_lhs_binop {
-    ($($ty:ty),* $(,)?) => {
+// Every operator, for one element type.
+macro_rules! impl_scalar_lhs_ops_for {
+    ($ty:ty, [$($trait:ident :: $method:ident => $op:ident),* $(,)?]) => {
         $(
-            impl std::ops::Add<&Array> for $ty {
+            impl std::ops::$trait<&Array> for $ty {
                 type Output = Array;
-                fn add(self, rhs: &Array) -> Array {
-                    scalar_lhs_op(self, rhs, Array::add, "add")
-                }
-            }
-
-            impl std::ops::Sub<&Array> for $ty {
-                type Output = Array;
-                fn sub(self, rhs: &Array) -> Array {
-                    scalar_lhs_op(self, rhs, Array::subtract, "subtract")
-                }
-            }
-
-            impl std::ops::Mul<&Array> for $ty {
-                type Output = Array;
-                fn mul(self, rhs: &Array) -> Array {
-                    scalar_lhs_op(self, rhs, Array::multiply, "multiply")
-                }
-            }
-
-            impl std::ops::Div<&Array> for $ty {
-                type Output = Array;
-                fn div(self, rhs: &Array) -> Array {
-                    scalar_lhs_op(self, rhs, Array::divide, "divide")
+                fn $method(self, rhs: &Array) -> Array {
+                    scalar_lhs_op(self, rhs, Array::$op, stringify!($op))
                 }
             }
         )*
     };
 }
 
-// Every type with an `ArrayElement` impl, so the two directions stay symmetric.
-impl_scalar_lhs_binop!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+// Takes the operators once and the element types once, then generates the cross
+// product. The operator list stays a single token tree so it can be replayed
+// verbatim for each type: two repetitions of the same depth in one pattern get
+// zipped rather than nested, and these two lists have different lengths.
+macro_rules! impl_scalar_lhs_binop {
+    (ops = $ops:tt, types = [$($ty:ty),* $(,)?],) => {
+        $(
+            impl_scalar_lhs_ops_for!($ty, $ops);
+        )*
+    };
+}
+
+// Every operator and every type with an `ArrayElement` impl, so the two
+// directions stay symmetric.
+impl_scalar_lhs_binop! {
+    ops = [
+        Add::add => add,
+        Sub::sub => subtract,
+        Mul::mul => multiply,
+        Div::div => divide,
+        BitAnd::bitand => bitwise_and,
+        BitOr::bitor => bitwise_or,
+        BitXor::bitxor => bitwise_xor,
+        Shl::shl => left_shift,
+        Shr::shr => right_shift,
+    ],
+    types = [bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64],
+}
 
 // `a += &b`, for both array and scalar right-hand sides.
 //
@@ -1846,6 +1917,137 @@ mod tests {
     fn assigning_operator_panic_carries_mlx_message() {
         let mut a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
         a -= &Array::from_slice(&[1.0f32, 2.0], &[2]);
+    }
+
+    #[test]
+    fn bitwise_ops_twiddle_integer_bits() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[0b1100i32, 0b1010], &[2]);
+        let b = Array::from_slice(&[0b1010i32, 0b0110], &[2]);
+
+        assert_eq!(
+            a.bitwise_and(&b, &s).unwrap().to_vec::<i32>(),
+            vec![0b1000, 0b0010]
+        );
+        assert_eq!(
+            a.bitwise_or(&b, &s).unwrap().to_vec::<i32>(),
+            vec![0b1110, 0b1110]
+        );
+        assert_eq!(
+            a.bitwise_xor(&b, &s).unwrap().to_vec::<i32>(),
+            vec![0b0110, 0b1100]
+        );
+        // Two's complement, as in Rust: `!0` is -1 and `!12` is -13.
+        assert_eq!(
+            Array::from_slice(&[0i32, 12], &[2])
+                .bitwise_invert(&s)
+                .unwrap()
+                .to_vec::<i32>(),
+            vec![-1, -13]
+        );
+    }
+
+    #[test]
+    fn shifts_scale_by_powers_of_two() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1i32, 8], &[2]);
+        let by = Array::from_slice(&[3i32, 2], &[2]);
+        assert_eq!(a.left_shift(&by, &s).unwrap().to_vec::<i32>(), vec![8, 32]);
+        assert_eq!(a.right_shift(&by, &s).unwrap().to_vec::<i32>(), vec![0, 2]);
+    }
+
+    #[test]
+    fn bitwise_ops_on_bool_arrays_are_logical() {
+        let s = Stream::cpu();
+        let x = Array::from_slice(&[true, true, false, false], &[4]);
+        let y = Array::from_slice(&[true, false, true, false], &[4]);
+
+        // MLX defines the bitwise ops on `bool` as the logical ones, which is
+        // what lets `&`/`|`/`!` work on comparison masks.
+        assert_eq!(
+            x.bitwise_and(&y, &s).unwrap().to_vec::<bool>(),
+            x.logical_and(&y, &s).unwrap().to_vec::<bool>()
+        );
+        assert_eq!(
+            x.bitwise_or(&y, &s).unwrap().to_vec::<bool>(),
+            x.logical_or(&y, &s).unwrap().to_vec::<bool>()
+        );
+        assert_eq!(
+            x.bitwise_invert(&s).unwrap().to_vec::<bool>(),
+            x.logical_not(&s).unwrap().to_vec::<bool>()
+        );
+        // Still bool, not widened to an integer.
+        assert_eq!(x.bitwise_and(&y, &s).unwrap().dtype(), Dtype::Bool);
+    }
+
+    #[test]
+    fn bitwise_ops_reject_floats() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        // Rust has no `&` for `f32` either; here it surfaces as an error.
+        assert!(a.bitwise_and(&a, &s).is_err());
+        assert!(a.bitwise_invert(&s).is_err());
+    }
+
+    #[test]
+    fn bitwise_operators_match_methods() {
+        let s = Stream::cpu();
+        Stream::cpu().set_as_default();
+        let a = Array::from_slice(&[0b1100i32, 0b1010], &[2]);
+        let b = Array::from_slice(&[0b1010i32, 0b0110], &[2]);
+
+        assert_eq!(
+            (&a & &b).to_vec::<i32>(),
+            a.bitwise_and(&b, &s).unwrap().to_vec::<i32>()
+        );
+        assert_eq!(
+            (&a | &b).to_vec::<i32>(),
+            a.bitwise_or(&b, &s).unwrap().to_vec::<i32>()
+        );
+        assert_eq!(
+            (&a ^ &b).to_vec::<i32>(),
+            a.bitwise_xor(&b, &s).unwrap().to_vec::<i32>()
+        );
+        assert_eq!((!&a).to_vec::<i32>(), vec![-13, -11]);
+
+        // Scalars on either side, including the non-commutative shifts.
+        assert_eq!((&a & 0b1111i32).to_vec::<i32>(), vec![0b1100, 0b1010]);
+        assert_eq!((0b1111i32 & &a).to_vec::<i32>(), vec![0b1100, 0b1010]);
+        assert_eq!(
+            (&Array::from_slice(&[1i32, 2], &[2]) << 2i32).to_vec::<i32>(),
+            vec![4, 8]
+        );
+        assert_eq!(
+            (1i32 << &Array::from_slice(&[2i32, 3], &[2])).to_vec::<i32>(),
+            vec![4, 8]
+        );
+    }
+
+    #[test]
+    fn operators_combine_comparison_masks() {
+        let s = Stream::cpu();
+        Stream::cpu().set_as_default();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // The payoff: masks combine with operators instead of chained methods.
+        let hi = a.greater(&Array::from_scalar(3.0f32), &s).unwrap();
+        let lo = a.less(&Array::from_scalar(5.0f32), &s).unwrap();
+        assert_eq!(
+            (&hi & &lo).to_vec::<bool>(),
+            vec![false, false, false, true, false, false]
+        );
+        assert_eq!((&hi | &lo).to_vec::<bool>(), vec![true; 6]);
+        assert_eq!(
+            (!&hi).to_vec::<bool>(),
+            vec![true, true, true, false, false, false]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Array::bitwise_invert failed: MLX error:")]
+    fn bitwise_operator_panic_carries_mlx_message() {
+        // `!` on a float array: an error from MLX, so the operator panics.
+        let _ = !&Array::from_slice(&[1.0f32], &[1]);
     }
 
     #[test]
