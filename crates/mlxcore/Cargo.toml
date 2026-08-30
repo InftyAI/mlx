@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Safe, idiomatic Rust bindings for Apple's MLX array framework."
+readme = "../../README.md"
+keywords = ["mlx", "apple", "metal", "array", "machine-learning"]
+categories = ["api-bindings", "mathematics"]
 
 [features]
 default = ["metal", "accelerate"]

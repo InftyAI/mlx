@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Low-level FFI bindings to mlx-c, the C API for Apple's MLX framework."
+keywords = ["mlx", "apple", "metal", "ffi", "bindings"]
+categories = ["external-ffi-bindings"]
 links = "mlxc"
 build = "build.rs"
 

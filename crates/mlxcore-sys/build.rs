@@ -17,11 +17,16 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Workspace layout: <root>/crates/mlxcore-sys -> <root>/third_party/mlx-c
+    // mlx-c lives *inside* this crate rather than at the workspace root, because
+    // `cargo package` only ships files under the crate directory. A path that
+    // escaped upwards would build here and then fail for anyone installing from
+    // crates.io.
     let mlx_c_dir = manifest_dir
-        .join("../../third_party/mlx-c")
+        .join("third_party/mlx-c")
         .canonicalize()
-        .expect("third_party/mlx-c submodule not found — run `git submodule update --init`");
+        .expect(
+            "third_party/mlx-c submodule not found — run `git submodule update --init --recursive`",
+        );
 
     // --- 1. Build mlx-c (+ MLX via FetchContent) with CMake ---------------
     let mut cfg = cmake::Config::new(&mlx_c_dir);

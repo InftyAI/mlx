@@ -1,7 +1,7 @@
 //! A tour of the `mlxcore` API: constructors, arithmetic, reductions, shape
 //! manipulation, comparisons, and stream control.
 //!
-//! For a worked end-to-end computation, see `examples/linear.rs`.
+//! For a worked end-to-end computation, see `examples/relu.rs`.
 //!
 //! Run with:
 //! ```sh

@@ -2,7 +2,7 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo run --example linear
+//! cargo run --example relu
 //! ```
 
 use mlxcore::{Array, Stream, random};
