@@ -1,8 +1,36 @@
 # MLX
 
+[![crates.io](https://img.shields.io/crates/v/mlxcore.svg)](https://crates.io/crates/mlxcore)
+[![License](https://img.shields.io/github/license/InftyAI/mlx)](LICENSE)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/v5qb2bPvd3)
+
 Rust bindings for Apple's [MLX](https://github.com/ml-explore/mlx) framework.
 
 > **Platform:** Apple Silicon (macOS) only.
+
+## Installation
+
+```sh
+cargo add mlxcore
+```
+
+## Quick start
+
+```rust
+use mlxcore::{Array, Stream};
+
+fn main() -> mlxcore::Result<()> {
+    let s = Stream::default();
+
+    // The `f32` suffix matters — see the note further down.
+    let x = Array::from_slice(&[1.0f32, 4.0, 9.0], &[3]);
+
+    println!("{:?}", x.sqrt(&s)?.to_vec::<f32>()); // [1.0, 2.0, 3.0]
+    println!("{:?}", (&x * 2.0f32).to_vec::<f32>()); // [2.0, 8.0, 18.0]
+
+    Ok(())
+}
+```
 
 ## Architecture
 
@@ -19,7 +47,7 @@ MLX itself is C++, which Rust cannot bind to directly. We bind against
 [`mlx-c`](https://github.com/ml-explore/mlx-c), Apple's official C API, whose
 CMake build pulls in MLX via `FetchContent`.
 
-## Building
+## Building from source
 
 ```sh
 git submodule update --init --recursive
@@ -35,7 +63,8 @@ The first build compiles MLX from source and takes several minutes.
 Runnable examples live in `crates/mlxcore/examples`:
 
 ```sh
-cargo run --example hello
+cargo run --example hello   # arrays, shapes, streams
+cargo run --example linear  # y = relu(x @ W + b) with random weights
 ```
 
 ## Note: suffix float literals with `f32`
