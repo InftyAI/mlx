@@ -8,6 +8,30 @@ Rust bindings for Apple's [MLX](https://github.com/ml-explore/mlx) framework.
 
 > **Platform:** Apple Silicon (macOS) only.
 
+## Installation
+
+```sh
+cargo add mlxcore
+```
+
+## Quick start
+
+```rust
+use mlxcore::{Array, Stream};
+
+fn main() -> mlxcore::Result<()> {
+    let s = Stream::default();
+
+    // The `f32` suffix matters — see the note further down.
+    let x = Array::from_slice(&[1.0f32, 4.0, 9.0], &[3]);
+
+    println!("{:?}", x.sqrt(&s)?.to_vec::<f32>()); // [1.0, 2.0, 3.0]
+    println!("{:?}", (&x * 2.0f32).to_vec::<f32>()); // [2.0, 8.0, 18.0]
+
+    Ok(())
+}
+```
+
 ## Architecture
 
 The bindings are layered, the same way as [MLX Swift](https://github.com/ml-explore/mlx-swift):
@@ -23,7 +47,7 @@ MLX itself is C++, which Rust cannot bind to directly. We bind against
 [`mlx-c`](https://github.com/ml-explore/mlx-c), Apple's official C API, whose
 CMake build pulls in MLX via `FetchContent`.
 
-## Building
+## Building from source
 
 ```sh
 git submodule update --init --recursive
