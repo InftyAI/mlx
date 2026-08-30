@@ -1,5 +1,9 @@
 # MLX
 
+[![crates.io](https://img.shields.io/crates/v/mlxcore.svg)](https://crates.io/crates/mlxcore)
+[![License](https://img.shields.io/github/license/InftyAI/mlx)](LICENSE)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/v5qb2bPvd3)
+
 Rust bindings for Apple's [MLX](https://github.com/ml-explore/mlx) framework.
 
 > **Platform:** Apple Silicon (macOS) only.
