@@ -9,6 +9,7 @@ use crate::dtype::{ArrayElement, Dtype};
 use crate::error::{self, Result};
 use crate::ffi::as_ffi_ptr;
 use crate::stream::Stream;
+use crate::vector::VectorArray;
 
 /// An N-dimensional MLX array.
 ///
@@ -297,14 +298,29 @@ impl Array {
     /// `bool` becomes 0 or 1, and numeric-to-`bool` tests `!= 0`. Converting a
     /// float that is out of the target integer's range is *unspecified*.
     ///
-    /// Only dtypes with an [`ArrayElement`] impl can be targeted, so MLX's
-    /// `float16`, `bfloat16`, and `complex64` are out of reach for now.
+    /// Only dtypes with an [`ArrayElement`] impl can be targeted this way;
+    /// [`astype_dtype`](Self::astype_dtype) covers the rest.
     pub fn astype<T: ArrayElement>(&self, stream: &Stream) -> Result<Array> {
+        self.astype_dtype(T::DTYPE, stream)
+    }
+
+    /// Converts the elements to `dtype`.
+    ///
+    /// The runtime counterpart to [`astype`](Self::astype), and the only way to
+    /// reach `float16` and `bfloat16` — the dtypes with no Rust equivalent, and
+    /// the ones most published checkpoints store their weights in.
+    ///
+    /// An `Array` only holds a handle, so a `float16` array is fully usable
+    /// without a Rust `f16` type: arithmetic, `matmul`, `shape`, and `dtype` all
+    /// work. Only [`to_vec`](Self::to_vec) and [`item`](Self::item) need the
+    /// element type, and those still reject it — so cast to `float32` before
+    /// reading results back out.
+    pub fn astype_dtype(&self, dtype: Dtype, stream: &Stream) -> Result<Array> {
         error::install();
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: handle/stream are valid; the result is written into `out`.
         let status =
-            unsafe { sys::mlx_astype(&mut out, self.handle, T::DTYPE.as_raw(), stream.as_raw()) };
+            unsafe { sys::mlx_astype(&mut out, self.handle, dtype.as_raw(), stream.as_raw()) };
         Self::from_op(out, status)
     }
 
@@ -381,6 +397,11 @@ impl Array {
     /// Elementwise hyperbolic tangent.
     pub fn tanh(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_tanh)
+    }
+
+    /// Elementwise Gauss error function.
+    pub fn erf(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_erf)
     }
 
     /// Elementwise power: `self ** other`.
@@ -542,6 +563,40 @@ impl Array {
         self.binary_op(other, stream, sys::mlx_matmul)
     }
 
+    /// Fused `alpha * (a @ b) + beta * c`.
+    ///
+    /// The same value as `a.matmul(b)?.add(c)` with `alpha == beta == 1.0`, but
+    /// in a single kernel — which is what makes it the right primitive for a
+    /// linear layer with a bias. `c` broadcasts against the product, so a
+    /// per-output bias vector works directly.
+    ///
+    /// An associated function because there is no reason for any one of the
+    /// three operands to be the receiver.
+    pub fn addmm(
+        c: &Array,
+        a: &Array,
+        b: &Array,
+        alpha: f32,
+        beta: f32,
+        stream: &Stream,
+    ) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: all handles are valid; the result is written into `out`.
+        let status = unsafe {
+            sys::mlx_addmm(
+                &mut out,
+                c.as_raw(),
+                a.as_raw(),
+                b.as_raw(),
+                alpha,
+                beta,
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
     /// Sum of all elements, returning a scalar array.
     ///
     /// With `keepdims == false` the result is 0-dimensional.
@@ -649,6 +704,59 @@ impl Array {
         self.reduce_axes_op(axes, keepdims, stream, sys::mlx_any_axes)
     }
 
+    /// Softmax over every element, as one flat distribution.
+    ///
+    /// Unlike the reductions above the shape is unchanged — this normalizes
+    /// rather than reduces. In a model you almost always want
+    /// [`softmax_axes`](Self::softmax_axes) with the last axis instead.
+    ///
+    /// `precise` accumulates in `float32` for half-precision inputs. It costs a
+    /// little speed and avoids overflow in `exp`; on a `float32` array it makes
+    /// no difference.
+    pub fn softmax(&self, precise: bool, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; the result is written into `out`.
+        let status = unsafe { sys::mlx_softmax(&mut out, self.handle, precise, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
+    /// Softmax over the given axes, leaving the shape unchanged.
+    ///
+    /// `a.softmax_axes(&[-1], true, &stream)` is the usual per-row distribution
+    /// over logits. See [`softmax`](Self::softmax) for `precise`.
+    pub fn softmax_axes(&self, axes: &[i32], precise: bool, stream: &Stream) -> Result<Array> {
+        error::install();
+        let axes_ptr = as_ffi_ptr(axes);
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: `axes_ptr`/`axes.len()` describe a valid slice (or null/0) for
+        // the duration of the call; handle/stream are valid.
+        let status = unsafe {
+            sys::mlx_softmax_axes(
+                &mut out,
+                self.handle,
+                axes_ptr,
+                axes.len(),
+                precise,
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
+    /// Every element sorted ascending, as a flat 1-dimensional array.
+    pub fn sort(&self, stream: &Stream) -> Result<Array> {
+        self.unary_op(stream, sys::mlx_sort)
+    }
+
+    /// Sorts along `axis`, ascending, keeping the shape.
+    ///
+    /// There is no descending option and no `k`-largest shortcut: take the tail
+    /// with [`slice_axis`](Self::slice_axis), which is what a top-k reads as.
+    pub fn sort_axis(&self, axis: i32, stream: &Stream) -> Result<Array> {
+        self.axis_op(axis, stream, sys::mlx_sort_axis)
+    }
+
     /// Returns a new array with the same data reinterpreted as `shape`.
     ///
     /// The product of `shape` must equal [`size`](Self::size).
@@ -666,9 +774,44 @@ impl Array {
         self.unary_op(stream, sys::mlx_transpose)
     }
 
+    /// Permutes the axes into the order given by `axes`.
+    ///
+    /// `axes` must be a permutation of `0..ndim()`, and names the *source* axis
+    /// for each output position: `x.transpose_axes(&[0, 2, 1, 3], &s)` on a
+    /// `(batch, len, heads, head_dim)` array gives `(batch, heads, len,
+    /// head_dim)`, the layout attention kernels expect. Negative entries count
+    /// from the end.
+    pub fn transpose_axes(&self, axes: &[i32], stream: &Stream) -> Result<Array> {
+        self.shape_op(axes, stream, sys::mlx_transpose_axes)
+    }
+
+    /// Exchanges two axes, leaving the rest in place.
+    ///
+    /// `w.swapaxes(-2, -1, &s)` is the transpose a linear layer needs, where
+    /// weights are stored `(out_features, in_features)` but the product wants
+    /// `x @ w.T`. Cheaper to read than the full permutation
+    /// [`transpose_axes`](Self::transpose_axes) would spell out.
+    pub fn swapaxes(&self, axis1: i32, axis2: i32, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; the result is written into `out`.
+        let status =
+            unsafe { sys::mlx_swapaxes(&mut out, self.handle, axis1, axis2, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
     /// Removes all axes of length 1.
     pub fn squeeze(&self, stream: &Stream) -> Result<Array> {
         self.unary_op(stream, sys::mlx_squeeze)
+    }
+
+    /// Removes the given axes, each of which must have length 1.
+    ///
+    /// The targeted counterpart to [`squeeze`](Self::squeeze): dropping a known
+    /// trailing axis with `a.squeeze_axes(&[-1], &s)` cannot accidentally also
+    /// collapse a batch dimension that happens to be 1.
+    pub fn squeeze_axes(&self, axes: &[i32], stream: &Stream) -> Result<Array> {
+        self.shape_op(axes, stream, sys::mlx_squeeze_axes)
     }
 
     /// Inserts a new axis of length 1 at position `axis`.
@@ -677,6 +820,249 @@ impl Array {
         let mut out = unsafe { sys::mlx_array_new() };
         // SAFETY: handle/stream are valid; `mlx_expand_dims` writes the result into `out`.
         let status = unsafe { sys::mlx_expand_dims(&mut out, self.handle, axis, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
+    // Indexing. Rust cannot overload `[]` to return a new `Array` — `Index` must
+    // hand back a reference to something that already exists — so NumPy-style
+    // subscripting is spelled out as these methods instead.
+
+    /// Gathers elements at `indices` from the flattened array.
+    ///
+    /// `self` is treated as 1-dimensional, so the result takes `indices`'s
+    /// shape. To index a single axis and keep the others, use
+    /// [`take_axis`](Self::take_axis).
+    ///
+    /// `indices` must be an integer array; negative indices count from the end.
+    pub fn take(&self, indices: &Array, stream: &Stream) -> Result<Array> {
+        self.binary_op(indices, stream, sys::mlx_take)
+    }
+
+    /// Gathers slices along `axis` at `indices`.
+    ///
+    /// `axis` is replaced by `indices`'s shape, so taking `(2, 3)` indices from
+    /// a `(10, 4)` array along axis 0 gives `(2, 3, 4)`. A 0-dimensional
+    /// `indices` therefore *removes* the axis, which is how a single row is
+    /// selected.
+    ///
+    /// This is the embedding lookup: `weight.take_axis(&ids, 0, &s)` turns
+    /// `(vocab, dims)` weights and `(batch, len)` token ids into
+    /// `(batch, len, dims)`.
+    ///
+    /// Negative `axis` counts from the end.
+    pub fn take_axis(&self, indices: &Array, axis: i32, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: all handles are valid; the result is written into `out`.
+        let status = unsafe {
+            sys::mlx_take_axis(
+                &mut out,
+                self.handle,
+                indices.as_raw(),
+                axis,
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
+    /// Gathers one element per index along `axis`, pairing `self` and `indices`
+    /// elementwise on every other axis.
+    ///
+    /// `indices` must have the same rank as `self` and match it on every axis
+    /// but `axis`; the result has `indices`'s shape. Unlike
+    /// [`take_axis`](Self::take_axis) the index *varies with position*, which
+    /// makes this the tool for "row `i` of batch element `i`" gathers that would
+    /// otherwise need NumPy fancy indexing: broadcast a `(batch, count)` index
+    /// array to `(batch, count, dims)` and take along axis 1 to pull `count`
+    /// chosen positions out of each sequence.
+    pub fn take_along_axis(&self, indices: &Array, axis: i32, stream: &Stream) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: all handles are valid; the result is written into `out`.
+        let status = unsafe {
+            sys::mlx_take_along_axis(
+                &mut out,
+                self.handle,
+                indices.as_raw(),
+                axis,
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
+    /// Extracts the strided region between `start` and `stop`.
+    ///
+    /// All three slices need one entry per dimension — there is no `:`
+    /// shorthand, so pass `0` and the axis length for axes you want whole, or
+    /// use [`slice_axis`](Self::slice_axis) when only one axis is interesting.
+    /// Bounds follow Python's `a[start:stop:step]`: negative values count from
+    /// the end and out-of-range values clamp rather than erroring.
+    pub fn slice(
+        &self,
+        start: &[i32],
+        stop: &[i32],
+        strides: &[i32],
+        stream: &Stream,
+    ) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: each ptr/len pair describes a valid slice (or null/0) for the
+        // duration of the call; handle/stream are valid.
+        let status = unsafe {
+            sys::mlx_slice(
+                &mut out,
+                self.handle,
+                as_ffi_ptr(start),
+                start.len(),
+                as_ffi_ptr(stop),
+                stop.len(),
+                as_ffi_ptr(strides),
+                strides.len(),
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
+    /// Slices a single axis, keeping every other axis whole.
+    ///
+    /// [`slice`](Self::slice) without spelling out the axes you are not
+    /// touching. `stop` of `None` runs to the end, so the last two entries of
+    /// the final axis — a two-way top-k after [`sort_axis`](Self::sort_axis) —
+    /// are `p.slice_axis(-1, -2, None, &s)`.
+    ///
+    /// The axis keeps its dimension even when one element is selected; combine
+    /// with [`squeeze_axes`](Self::squeeze_axes) to drop it, or use
+    /// [`take_axis`](Self::take_axis) with a 0-dimensional index.
+    ///
+    /// # Errors
+    /// Returns an error if `axis` is out of range for this array.
+    pub fn slice_axis(
+        &self,
+        axis: i32,
+        start: i32,
+        stop: Option<i32>,
+        stream: &Stream,
+    ) -> Result<Array> {
+        let shape = self.shape();
+        let ndim = shape.len() as i32;
+        let axis = if axis < 0 { axis + ndim } else { axis };
+        if axis < 0 || axis >= ndim {
+            return Err(crate::Error::new(format!(
+                "axis {axis} out of range for an array with {ndim} dimension(s)"
+            )));
+        }
+
+        // Whole-array bounds, then narrow the one axis. mlx clamps a `stop`
+        // beyond the axis length, so the dimension itself is a fine "to the end".
+        let axis = axis as usize;
+        let starts = {
+            let mut s = vec![0; shape.len()];
+            s[axis] = start;
+            s
+        };
+        let stops = {
+            let mut s = shape.clone();
+            s[axis] = stop.unwrap_or(shape[axis]);
+            s
+        };
+        self.slice(&starts, &stops, &vec![1; shape.len()], stream)
+    }
+
+    /// Selects from `on_true` where `condition` is true and `on_false` elsewhere.
+    ///
+    /// All three operands broadcast against each other, so masking a row of
+    /// logits down to `-inf` is
+    /// `Array::where_cond(&mask, &logits, &Array::from_scalar(f32::MIN), &s)`.
+    ///
+    /// An associated function, not a method: MLX names this after the condition
+    /// (`mx.where`), and `where` is a Rust keyword.
+    pub fn where_cond(
+        condition: &Array,
+        on_true: &Array,
+        on_false: &Array,
+        stream: &Stream,
+    ) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: all handles are valid; the result is written into `out`.
+        let status = unsafe {
+            sys::mlx_where(
+                &mut out,
+                condition.as_raw(),
+                on_true.as_raw(),
+                on_false.as_raw(),
+                stream.as_raw(),
+            )
+        };
+        Self::from_op(out, status)
+    }
+
+    /// Splits into `parts` equally-sized pieces along `axis`.
+    ///
+    /// `self.shape()[axis]` must be divisible by `parts`. This is the gated-MLP
+    /// idiom: one `(.., 2 * d)` projection split into value and gate halves.
+    pub fn split(&self, parts: i32, axis: i32, stream: &Stream) -> Result<Vec<Array>> {
+        error::install();
+        let mut out = VectorArray::new();
+        // SAFETY: handle/stream are valid; the pieces are written into `out`,
+        // which frees them on drop.
+        let status =
+            unsafe { sys::mlx_split(out.as_mut_ptr(), self.handle, parts, axis, stream.as_raw()) };
+        error::check(status)?;
+        out.to_arrays()
+    }
+
+    /// Stacks `arrays` along a *new* axis inserted at `axis`.
+    ///
+    /// Every array must have the same shape, and the result gains one dimension
+    /// of length `arrays.len()`. Compare [`concatenate`](Self::concatenate),
+    /// which joins along an axis that already exists.
+    pub fn stack(arrays: &[&Array], axis: i32, stream: &Stream) -> Result<Array> {
+        Self::vector_op(arrays, axis, stream, sys::mlx_stack_axis)
+    }
+
+    /// Joins `arrays` along the existing `axis`.
+    ///
+    /// Shapes must agree on every axis but `axis`, whose lengths add up.
+    pub fn concatenate(arrays: &[&Array], axis: i32, stream: &Stream) -> Result<Array> {
+        Self::vector_op(arrays, axis, stream, sys::mlx_concatenate_axis)
+    }
+
+    /// Shared plumbing for `res = op(a, axis, stream)` single-axis ops.
+    fn axis_op(
+        &self,
+        axis: i32,
+        stream: &Stream,
+        op: unsafe extern "C" fn(*mut sys::mlx_array, sys::mlx_array, i32, sys::mlx_stream) -> i32,
+    ) -> Result<Array> {
+        error::install();
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: handle/stream are valid; `op` writes the result into `out`.
+        let status = unsafe { op(&mut out, self.handle, axis, stream.as_raw()) };
+        Self::from_op(out, status)
+    }
+
+    /// Shared plumbing for `res = op(arrays, axis, stream)` combining ops.
+    fn vector_op(
+        arrays: &[&Array],
+        axis: i32,
+        stream: &Stream,
+        op: unsafe extern "C" fn(
+            *mut sys::mlx_array,
+            sys::mlx_vector_array,
+            i32,
+            sys::mlx_stream,
+        ) -> i32,
+    ) -> Result<Array> {
+        error::install();
+        let inputs = VectorArray::from_arrays(arrays);
+        let mut out = unsafe { sys::mlx_array_new() };
+        // SAFETY: `inputs` holds handles to the borrowed arrays and outlives the
+        // call; the result is written into `out`.
+        let status = unsafe { op(&mut out, inputs.as_raw(), axis, stream.as_raw()) };
         Self::from_op(out, status)
     }
 
@@ -2058,5 +2444,408 @@ mod tests {
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
         let b = Array::from_slice(&[1.0f32, 2.0], &[2]);
         let _ = &a + &b;
+    }
+
+    #[test]
+    fn astype_dtype_reaches_half_precision() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.5f32, 2.5], &[2]);
+
+        // The dtypes `astype::<T>` cannot name, because Rust has no `f16`.
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let half = a.astype_dtype(dtype, &s).unwrap();
+            assert_eq!(half.dtype(), dtype);
+            // Still a usable array: shape, arithmetic, and a cast back all work.
+            assert_eq!(half.shape(), vec![2]);
+            let doubled = half.add(&half, &s).unwrap();
+            assert_eq!(doubled.dtype(), dtype);
+            assert_eq!(
+                doubled.astype::<f32>(&s).unwrap().to_vec::<f32>(),
+                vec![3.0, 5.0]
+            );
+        }
+    }
+
+    #[test]
+    fn erf_is_the_gelu_building_block() {
+        let s = Stream::cpu();
+        let x = Array::from_slice(&[0.0f32, 1.0, -1.0], &[3]);
+
+        let out = x.erf(&s).unwrap().to_vec::<f32>();
+
+        // erf(0) = 0 and erf is odd, with erf(1) = 0.8427.
+        assert!(out[0].abs() < 1e-6, "{out:?}");
+        assert!((out[1] - 0.8427).abs() < 1e-3, "{out:?}");
+        assert!((out[2] + 0.8427).abs() < 1e-3, "{out:?}");
+    }
+
+    #[test]
+    fn addmm_matches_matmul_plus_bias() {
+        let s = Stream::cpu();
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let w = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[2, 2]);
+        let bias = Array::from_slice(&[10.0f32, 20.0], &[2]);
+
+        let fused = Array::addmm(&bias, &x, &w, 1.0, 1.0, &s).unwrap();
+
+        // `w` is the identity, so this is `x` plus a broadcast bias row.
+        assert_eq!(fused.shape(), vec![2, 2]);
+        assert_eq!(fused.to_vec::<f32>(), vec![11.0, 22.0, 13.0, 24.0]);
+        // And it agrees with spelling the two steps out.
+        let separate = x.matmul(&w, &s).unwrap().add(&bias, &s).unwrap();
+        assert_eq!(fused.to_vec::<f32>(), separate.to_vec::<f32>());
+    }
+
+    #[test]
+    fn addmm_scales_both_terms() {
+        let s = Stream::cpu();
+        let x = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0], &[2, 2]);
+        let c = Array::from_slice(&[1.0f32], &[1]);
+
+        // alpha * (x @ x) + beta * c, with each row of `x @ x` summing to 2.
+        let out = Array::addmm(&c, &x, &x, 3.0, 10.0, &s).unwrap();
+
+        assert_eq!(out.to_vec::<f32>(), vec![16.0; 4]);
+    }
+
+    #[test]
+    fn softmax_axes_normalizes_each_row() {
+        let s = Stream::cpu();
+        // Equal logits within each row, so each row is a uniform distribution —
+        // and the rows differ, which a whole-array softmax would blur together.
+        let a = Array::from_slice(&[1.0f32, 1.0, 5.0, 5.0], &[2, 2]);
+
+        let p = a.softmax_axes(&[-1], true, &s).unwrap();
+
+        assert_eq!(p.shape(), vec![2, 2]);
+        assert_eq!(p.to_vec::<f32>(), vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn softmax_over_all_elements_sums_to_one() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+
+        let p = a.softmax(true, &s).unwrap();
+
+        // Normalizing, not reducing: the shape survives.
+        assert_eq!(p.shape(), vec![2, 2]);
+        let total = p.sum(false, &s).unwrap().item::<f32>();
+        assert!((total - 1.0).abs() < 1e-5, "{total}");
+    }
+
+    #[test]
+    fn sort_axis_orders_rows_independently() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[3.0f32, 1.0, 2.0, 9.0, 7.0, 8.0], &[2, 3]);
+
+        let sorted = a.sort_axis(-1, &s).unwrap();
+
+        assert_eq!(sorted.shape(), vec![2, 3]);
+        assert_eq!(sorted.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn sort_flattens_the_whole_array() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[3.0f32, 1.0, 2.0, 0.0], &[2, 2]);
+
+        let sorted = a.sort(&s).unwrap();
+
+        assert_eq!(sorted.shape(), vec![4]);
+        assert_eq!(sorted.to_vec::<f32>(), vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn sorting_then_slicing_gives_a_top_k() {
+        let s = Stream::cpu();
+        let p = Array::from_slice(&[0.1f32, 0.7, 0.2], &[1, 3]);
+
+        // The idiom the docs point at: ascending sort, then take the tail.
+        let top2 = p
+            .sort_axis(-1, &s)
+            .unwrap()
+            .slice_axis(-1, -2, None, &s)
+            .unwrap();
+
+        assert_eq!(top2.shape(), vec![1, 2]);
+        assert_eq!(top2.to_vec::<f32>(), vec![0.2, 0.7]);
+    }
+
+    #[test]
+    fn transpose_axes_permutes_to_attention_layout() {
+        let s = Stream::cpu();
+        // (batch, length, heads, head_dim) -> (batch, heads, length, head_dim).
+        let a = Array::zeros::<f32>(&[2, 8, 4, 16], &s).unwrap();
+
+        let out = a.transpose_axes(&[0, 2, 1, 3], &s).unwrap();
+
+        assert_eq!(out.shape(), vec![2, 4, 8, 16]);
+    }
+
+    #[test]
+    fn transpose_axes_moves_the_data_too() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        let out = a.transpose_axes(&[1, 0], &s).unwrap();
+
+        assert_eq!(out.shape(), vec![3, 2]);
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn swapaxes_transposes_the_last_two() {
+        let s = Stream::cpu();
+        let w = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // The transpose a linear layer needs: (out, in) -> (in, out).
+        let out = w.swapaxes(-2, -1, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![3, 2]);
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn squeeze_axes_drops_only_the_named_axis() {
+        let s = Stream::cpu();
+        // A batch of 1 that must survive, and a trailing axis that must not.
+        let a = Array::zeros::<f32>(&[1, 3, 1], &s).unwrap();
+
+        assert_eq!(a.squeeze_axes(&[-1], &s).unwrap().shape(), vec![1, 3]);
+        // Where the untargeted `squeeze` would have taken both.
+        assert_eq!(a.squeeze(&s).unwrap().shape(), vec![3]);
+    }
+
+    #[test]
+    fn squeeze_axes_rejects_a_longer_axis() {
+        let s = Stream::cpu();
+        let a = Array::zeros::<f32>(&[2, 3], &s).unwrap();
+
+        assert!(a.squeeze_axes(&[0], &s).is_err());
+    }
+
+    #[test]
+    fn take_gathers_from_the_flattened_array() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[2, 2]);
+        let indices = Array::from_slice(&[3i32, 0], &[2]);
+
+        let out = a.take(&indices, &s).unwrap();
+
+        // Row-major order, so index 3 is the last element.
+        assert_eq!(out.shape(), vec![2]);
+        assert_eq!(out.to_vec::<f32>(), vec![40.0, 10.0]);
+    }
+
+    #[test]
+    fn take_axis_is_an_embedding_lookup() {
+        let s = Stream::cpu();
+        // A (vocab=3, dims=2) embedding table and a (batch=1, len=3) id array.
+        let weight = Array::from_slice(&[0.0f32, 0.1, 1.0, 1.1, 2.0, 2.1], &[3, 2]);
+        let ids = Array::from_slice(&[2i32, 0, 2], &[1, 3]);
+
+        let out = weight.take_axis(&ids, 0, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![1, 3, 2]);
+        assert_eq!(out.to_vec::<f32>(), vec![2.0, 2.1, 0.0, 0.1, 2.0, 2.1]);
+    }
+
+    #[test]
+    fn take_axis_with_a_scalar_index_removes_the_axis() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+
+        // The `h[:, 0]` of a Python model: select one position, drop the axis.
+        let out = a.take_axis(&Array::from_scalar(0i32), 1, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![2]);
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn take_along_axis_varies_the_index_per_row() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        // Row 0 wants column 2, row 1 wants column 0 — something `take_axis`
+        // cannot express, since its indices apply to every row alike.
+        let indices = Array::from_slice(&[2i32, 0], &[2, 1]);
+
+        let out = a.take_along_axis(&indices, 1, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![2, 1]);
+        assert_eq!(out.to_vec::<f32>(), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn take_along_axis_gathers_marker_positions() {
+        let s = Stream::cpu();
+        // The real use: pull chosen positions out of each sequence of a batch.
+        // (batch=2, len=3, dims=2), with hidden state `position * 10 + feature`.
+        let h = Array::from_slice(
+            &[
+                0.0f32, 1.0, 10.0, 11.0, 20.0, 21.0, // batch 0
+                0.0, 1.0, 10.0, 11.0, 20.0, 21.0, // batch 1
+            ],
+            &[2, 3, 2],
+        );
+        // Batch 0 wants positions (2, 0); batch 1 wants (1, 1).
+        let positions = Array::from_slice(&[2i32, 0, 1, 1], &[2, 2]);
+
+        let indices = positions
+            .expand_dims(-1, &s)
+            .unwrap()
+            .broadcast_to(&[2, 2, 2], &s)
+            .unwrap();
+        let out = h.take_along_axis(&indices, 1, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![2, 2, 2]);
+        assert_eq!(
+            out.to_vec::<f32>(),
+            vec![
+                20.0, 21.0, 0.0, 1.0, // batch 0: positions 2 then 0
+                10.0, 11.0, 10.0, 11.0, // batch 1: position 1 twice
+            ]
+        );
+    }
+
+    #[test]
+    fn slice_extracts_a_strided_region() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // Every row, every other column.
+        let out = a.slice(&[0, 0], &[2, 3], &[1, 2], &s).unwrap();
+
+        assert_eq!(out.shape(), vec![2, 2]);
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 3.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn slice_axis_keeps_other_axes_whole() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // The last two columns, via a negative start and an open end.
+        let tail = a.slice_axis(-1, -2, None, &s).unwrap();
+        assert_eq!(tail.shape(), vec![2, 2]);
+        assert_eq!(tail.to_vec::<f32>(), vec![2.0, 3.0, 5.0, 6.0]);
+
+        // A single row, with the axis retained.
+        let first = a.slice_axis(0, 0, Some(1), &s).unwrap();
+        assert_eq!(first.shape(), vec![1, 3]);
+        assert_eq!(first.to_vec::<f32>(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn slice_axis_rejects_an_out_of_range_axis() {
+        let s = Stream::cpu();
+        let a = Array::zeros::<f32>(&[2, 3], &s).unwrap();
+
+        let err = a.slice_axis(2, 0, None, &s).unwrap_err();
+
+        assert!(err.message().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn where_cond_selects_elementwise() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let mask = Array::from_slice(&[true, false, true], &[3]);
+
+        // The masked-logits idiom: keep where true, sink to a floor elsewhere.
+        let out = Array::where_cond(&mask, &a, &Array::from_scalar(-1e4f32), &s).unwrap();
+
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, -1e4, 3.0]);
+    }
+
+    #[test]
+    fn where_cond_broadcasts_all_three_operands() {
+        let s = Stream::cpu();
+        // A (2, 1) condition against (1, 3) branches.
+        let mask = Array::from_slice(&[true, false], &[2, 1]);
+        let yes = Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 3]);
+        let no = Array::from_scalar(0.0f32);
+
+        let out = Array::where_cond(&mask, &yes, &no, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![2, 3]);
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn split_halves_a_gated_projection() {
+        let s = Stream::cpu();
+        // The GLU shape: one (2, 4) projection holding a value and a gate half.
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+
+        let parts = a.split(2, -1, &s).unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].shape(), vec![2, 2]);
+        assert_eq!(parts[0].to_vec::<f32>(), vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(parts[1].to_vec::<f32>(), vec![3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn split_rejects_an_uneven_division() {
+        let s = Stream::cpu();
+        let a = Array::zeros::<f32>(&[2, 3], &s).unwrap();
+
+        assert!(a.split(2, -1, &s).is_err());
+    }
+
+    #[test]
+    fn stack_adds_an_axis_and_concatenate_extends_one() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let b = Array::from_slice(&[3.0f32, 4.0], &[2]);
+
+        // The feature-vector idiom: separate scalars gathered into one axis.
+        let stacked = Array::stack(&[&a, &b], -1, &s).unwrap();
+        assert_eq!(stacked.shape(), vec![2, 2]);
+        assert_eq!(stacked.to_vec::<f32>(), vec![1.0, 3.0, 2.0, 4.0]);
+
+        // Whereas concatenating reuses the axis that is already there.
+        let joined = Array::concatenate(&[&a, &b], 0, &s).unwrap();
+        assert_eq!(joined.shape(), vec![4]);
+        assert_eq!(joined.to_vec::<f32>(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn concatenate_joins_unequal_lengths() {
+        let s = Stream::cpu();
+        // (1, 2) and (1, 1) along the last axis — the pooled-plus-features
+        // concatenation a decision head does.
+        let pooled = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
+        let extra = Array::from_slice(&[9.0f32], &[1, 1]);
+
+        let out = Array::concatenate(&[&pooled, &extra], -1, &s).unwrap();
+
+        assert_eq!(out.shape(), vec![1, 3]);
+        assert_eq!(out.to_vec::<f32>(), vec![1.0, 2.0, 9.0]);
+    }
+
+    #[test]
+    fn stack_rejects_mismatched_shapes() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let b = Array::from_slice(&[3.0f32], &[1]);
+
+        assert!(Array::stack(&[&a, &b], 0, &s).is_err());
+    }
+
+    #[test]
+    fn combining_ops_accept_a_single_array() {
+        let s = Stream::cpu();
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+
+        // A one-element vector is a legitimate degenerate case, and exercises
+        // the borrowed-handle bookkeeping without a second operand.
+        assert_eq!(Array::stack(&[&a], 0, &s).unwrap().shape(), vec![1, 2]);
+        assert_eq!(
+            Array::concatenate(&[&a], 0, &s).unwrap().to_vec::<f32>(),
+            vec![1.0, 2.0]
+        );
     }
 }

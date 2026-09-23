@@ -51,6 +51,15 @@ The mlx-c submodule sits inside `mlxcore-sys` rather than at the repository root
 because `cargo package` only ships files under the crate directory — from the
 root it would be missing from the published crate.
 
+Within `mlxcore`, the modules follow the mlx-c headers they wrap:
+
+| Module | Wraps | Holds |
+| --- | --- | --- |
+| `Array` (crate root) | `array.h`, `ops.h` | array construction, arithmetic, reductions, shapes, indexing |
+| `mlxcore::fast` | `fast.h` | fused kernels: `layer_norm`, `rms_norm`, `rope`, `scaled_dot_product_attention` |
+| `mlxcore::io` | `io.h` | `load_safetensors` / `save_safetensors` |
+| `mlxcore::random` | `random.h` | seeded keys, `uniform`, `normal` |
+
 ## Building from source
 
 ```sh
@@ -67,8 +76,9 @@ The first build compiles MLX from source and takes several minutes.
 Runnable examples live in `crates/mlxcore/examples`:
 
 ```sh
-cargo run --example hello   # arrays, shapes, streams
-cargo run --example relu    # y = relu(x @ W + b) with random weights
+cargo run --example hello       # arrays, shapes, streams
+cargo run --example relu        # y = relu(x @ W + b) with random weights
+cargo run --example attention   # a transformer attention block: QKV, RoPE, masked SDPA
 ```
 
 ## Note: suffix float literals with `f32`

@@ -18,7 +18,10 @@ mod dtype;
 mod error;
 mod ffi;
 mod stream;
+mod vector;
 
+pub mod fast;
+pub mod io;
 pub mod random;
 
 pub use array::Array;
